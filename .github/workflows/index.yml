@@ -1,0 +1,44 @@
+name: index
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: index
+  cancel-in-progress: false
+
+jobs:
+  index:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore previous snapshot
+        run: |
+          if git ls-remote --exit-code --heads origin data >/dev/null 2>&1; then
+            git clone --quiet --depth 1 --branch data "https://github.com/${GITHUB_REPOSITORY}.git" data
+            rm -rf data/.git
+          else
+            mkdir -p data
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Index Arc Mainnet
+        run: NET=mainnet BUDGET_SECONDS=1200 node src/run.mjs && NET=mainnet node src/summarize.mjs
+
+      - name: Index Arc Testnet
+        run: NET=testnet BUDGET_SECONDS=300 BACKFILL_HOURS=24 node src/run.mjs && NET=testnet node src/summarize.mjs
+
+      - name: Publish snapshot
+        run: ./scripts/publish.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
