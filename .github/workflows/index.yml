@@ -33,10 +33,10 @@ jobs:
           node-version: 22
 
       - name: Index Arc Mainnet
-        run: NET=mainnet BUDGET_SECONDS=1200 node src/run.mjs && NET=mainnet node src/summarize.mjs
+        run: NET=mainnet BUDGET_SECONDS=1200 node src/run.mjs && NET=mainnet node src/summarize.mjs && NET=mainnet node src/label.mjs
 
       - name: Index Arc Testnet
-        run: NET=testnet BUDGET_SECONDS=300 BACKFILL_HOURS=24 node src/run.mjs && NET=testnet node src/summarize.mjs
+        run: NET=testnet BUDGET_SECONDS=300 BACKFILL_HOURS=24 node src/run.mjs && NET=testnet node src/summarize.mjs && NET=testnet node src/label.mjs
 
       - name: Publish snapshot
         run: ./scripts/publish.sh
