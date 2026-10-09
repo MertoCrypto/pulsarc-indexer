@@ -1,0 +1,45 @@
+{
+  "apps": [
+    { "id": "usdc",            "anchors": [{ "address": "0x3600000000000000000000000000000000000000", "kind": "token", "usd": true }] },
+    { "id": "eurc",            "anchors": [{ "address": "0x89b50855aa3be2f677cd6303cec089b5f319d72a", "kind": "token" }] },
+    { "id": "usyc",            "anchors": [{ "address": "0x825ae482558415310c71b7e03d2bbbe409345903", "kind": "token" }] },
+    { "id": "cirbtc",          "anchors": [{ "address": "0xf0c4a4ce82a5746abaad9425360ab04fbba432bf", "kind": "token" }] },
+    { "id": "stablefx",        "anchors": [{ "address": "0xd68256f4d69c6bbecb873d8588ae0dc6b8e22e10", "kind": "contract" }] },
+    { "id": "memo",            "anchors": [{ "address": "0x5294e9927c3306dcbadb03fe70b92e01ccede505", "kind": "contract" }] },
+    { "id": "multicall",       "anchors": [{ "address": "0x522faf9a91c41c443c66765030741e4aace147d0", "kind": "contract" }] },
+    { "id": "cctp",            "anchors": [{ "address": "0x8fe6b999dc680ccfdd5bf7eb0974218be2542daa", "kind": "contract" }] },
+    { "id": "gateway",         "anchors": [{ "address": "0x0077777d7eba4688bdef3e311b846f25870a19b9", "kind": "contract" }] },
+    { "id": "erc8004",         "anchors": [{ "address": "0x8004a818bfb912233c491871b3d84c89a494bd9e", "kind": "contract" }] },
+    { "id": "erc8183",         "anchors": [{ "address": "0x0747eef0706327138c69792bf28cd525089e4583", "kind": "contract" }] },
+    { "id": "wusdc",           "anchors": [{ "address": "0x911b4000d3422f482f4062a913885f7b035382df", "kind": "token", "usd": true }] },
+    { "id": "arc-dollar",      "anchors": [
+      { "address": "0xed7cb772b49448027901546870425579596faae1", "kind": "token", "usd": true },
+      { "address": "0x3554d4d10682fdc680a2cb64ada35f8e7a297a32", "kind": "token" },
+      { "address": "0x429a1d105558f4727453d2a17df17ac9d5be1ea9", "kind": "token" },
+      { "address": "0x8dd16a98a3f5d767d5d08beecbea1cd8cf2832ee", "kind": "token" },
+      { "address": "0x6374151c499dadc9a54650d25cdff3b5688652ba", "kind": "token" }
+    ]},
+    { "id": "xylonet",         "anchors": [
+      { "address": "0x3df3966f5138143dce7a9cfddC2c0310ce083bb1", "kind": "token" },
+      { "address": "0x240eb85458cd41361bd8c3773253a1d78054f747", "kind": "token" }
+    ]},
+    { "id": "curve-usdc-eurc", "anchors": [
+      { "address": "0x2d84d79c852f6842abe0304b70bbaa1506add457", "kind": "token" },
+      { "address": "0xcd4e6c8056608e7ca5b8cd126f32c56c43d92979", "kind": "token" }
+    ]},
+    { "id": "swaparc",         "anchors": [
+      { "address": "0xbe7477bf91526fc9988c8f33e91b6db687119d45", "kind": "token" },
+      { "address": "0x454f21b7738a446f79ea4ff00e71b9e8e9e6fee9", "kind": "token" },
+      { "address": "0xb81816d4fbb3d33b56c3efc04675d1cded0f68b1", "kind": "token" },
+      { "address": "0x2e2c7b48b2422223ad9628da159f304192c24d3b", "kind": "token" }
+    ]},
+    { "id": "synthra",         "anchors": [{ "address": "0xc5124c846c6e6307986988dfb7e743327aa05f19", "kind": "token" }] },
+    { "id": "unitflow",        "anchors": [{ "address": "0x142ec8437f645baef1b3683f2065f53a26285a7a", "kind": "token" }] },
+    { "id": "arcflow",         "anchors": [{ "address": "0xfa61e1de61daf2ef4d8d9bad4b99fa21c8efab8a", "kind": "token" }] },
+    { "id": "axpha",           "anchors": [{ "address": "0xc0d12a7cf565a004757c62caf34dd37467f57f0e", "kind": "token" }] },
+    { "id": "onmifun",         "anchors": [
+      { "address": "0x9a09b4685073d873fb51a3d474a4559db2f979d3", "kind": "token" },
+      { "address": "0x95b0d01ebf734178e27ea8c44d654792e1ce9e29", "kind": "token" }
+    ]}
+  ]
+}

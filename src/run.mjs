@@ -10,6 +10,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { accumulateApps, compactApps } from './apps.mjs'
 
 const NETWORKS = {
   mainnet: { rpc: 'https://rpc.mainnet.arc.io', chainId: 5042 },
@@ -24,8 +25,31 @@ const BATCH = 15 // blocks per RPC round trip (2 calls each) — keeps well unde
 const PARALLEL = 1
 const PAUSE_MS = 80
 const TOP_PER_HOUR = 400 // contracts kept per hour
-const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', 'data', NET)
+const ROOT       = join(dirname(fileURLToPath(import.meta.url)), '..', 'data', NET)
+const INDEXER_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const BLOCK_SECONDS = 0.5
+
+// ── App config ──────────────────────────────────────────────────────────────
+// Loaded once at startup; a missing or empty file means no app stats (no error).
+let APPS_CONFIG = { apps: [] }
+try {
+  APPS_CONFIG = JSON.parse(await readFile(join(INDEXER_ROOT, `apps.${NET}.json`), 'utf8'))
+} catch {
+  // file absent or unparseable — app stats disabled for this run
+}
+const HAS_APPS = APPS_CONFIG.apps.length > 0
+
+// ── Decimals cache ───────────────────────────────────────────────────────────
+// data/<net>/meta.json stores { decimals: { <lc-address>: n } } so we only
+// call eth_call once per token address across all runs.
+const META_PATH = join(ROOT, 'meta.json')
+const DECIMALS_SELECTOR = '0x313ce567'
+
+let metaCache = { decimals: {} }
+try {
+  metaCache = JSON.parse(await readFile(META_PATH, 'utf8'))
+  if (!metaCache.decimals) metaCache.decimals = {}
+} catch { /* first run */ }
 
 const hex = (n) => '0x' + n.toString(16)
 const num = (h) => Number(BigInt(h))
@@ -53,6 +77,47 @@ async function rpc(calls, attempt = 0) {
 async function head() {
   const [h] = await rpc([{ jsonrpc: '2.0', id: 0, method: 'eth_blockNumber', params: [] }])
   return num(h)
+}
+
+/**
+ * Fetch and cache the `decimals()` return value for every usd token anchor that
+ * is not already in metaCache.decimals. Writes the updated cache to META_PATH.
+ * Safe to call when HAS_APPS is false (no-op).
+ */
+async function fetchDecimals() {
+  if (!HAS_APPS) return
+  const needed = []
+  for (const app of APPS_CONFIG.apps) {
+    for (const anchor of app.anchors) {
+      if (anchor.kind === 'token' && anchor.usd) {
+        const addr = anchor.address.toLowerCase()
+        if (!(addr in metaCache.decimals)) needed.push(addr)
+      }
+    }
+  }
+  if (!needed.length) return
+
+  const calls = needed.map((addr, i) => ({
+    jsonrpc: '2.0', id: i,
+    method: 'eth_call',
+    params: [{ to: addr, data: DECIMALS_SELECTOR }, 'latest'],
+  }))
+  let results
+  try {
+    results = await rpc(calls)
+  } catch (e) {
+    console.warn(`decimals fetch failed: ${e.message}`)
+    return
+  }
+  for (let i = 0; i < needed.length; i++) {
+    const hex = results[i]
+    if (hex && hex !== '0x' && hex.length >= 66) {
+      metaCache.decimals[needed[i]] = Number(BigInt(hex))
+    } else {
+      console.warn(`decimals() failed for ${needed[i]} — volume will be skipped`)
+      // Leave absent so apps.mjs skips volume rather than dividing by wrong value
+    }
+  }
 }
 
 async function readJson(path, fallback) {
@@ -113,6 +178,10 @@ async function apply(blockNumbers, out) {
       c.fee += fee
       c.from[r.from] = 1
     }
+    // ── App stats (v2) ──────────────────────────────────────────────────────
+    if (HAS_APPS && receipts.length) {
+      accumulateApps(h, receipts, APPS_CONFIG, metaCache.decimals)
+    }
   }
 }
 
@@ -129,6 +198,8 @@ function compact(h) {
   h.contractCount = rows.length
   delete h.contracts
   h.fees = +h.fees.toFixed(6)
+  // ── App stats (v2) ──────────────────────────────────────────────────────
+  compactApps(h)
 }
 
 async function flush(hourKeysTouched) {
@@ -142,6 +213,8 @@ async function flush(hourKeysTouched) {
 
 async function main() {
   const t0 = Date.now()
+  // Fetch and cache decimals for usd token anchors before processing blocks.
+  await fetchDecimals()
   const tip = await head()
   const statePath = join(ROOT, 'state.json')
   const state = await readJson(statePath, null)
@@ -176,6 +249,8 @@ async function main() {
   const openHourStart = lastHour ? (await dayFile(dayOf(lastHour)))[lastHour].first : null
 
   await flush(touched)
+  // Persist decimals cache so subsequent runs skip the eth_call.
+  if (HAS_APPS) await writeJson(META_PATH, metaCache)
   await writeJson(statePath, {
     next,
     tip,
