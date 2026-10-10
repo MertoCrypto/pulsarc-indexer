@@ -94,6 +94,7 @@ if (appsConfig.apps.length > 0) {
   const appsOut = {
     network: NET,
     generatedAt: new Date().toISOString(),
+    coverageHours: keys.length, // hourly buckets held; a window is real once this reaches its length
     note: 'walletHours sums distinct wallets per hour — an upper bound on unique wallets over the window',
     apps: {},
   }
