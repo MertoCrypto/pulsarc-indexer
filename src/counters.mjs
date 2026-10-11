@@ -225,7 +225,8 @@ export function decodeDepositForBurn(data, decimals) {
   // data is 0x-prefixed hex; each word is 32 bytes = 64 hex chars
   try {
     const raw = data.startsWith('0x') ? data.slice(2) : data
-    const word = (i) => BigInt('0x' + (raw.slice(i * 64, (i + 1) * 64) || '0'))
+    if (raw.length < 6 * 64) return null  // amount .. maxFee are words 0-5
+    const word = (i) => BigInt('0x' + raw.slice(i * 64, (i + 1) * 64))
     const amount  = Number(word(0)) / 10 ** decimals
     const domain  = Number(word(2))     // destinationDomain uint32 in word 2
     const maxFee  = Number(word(5)) / 10 ** decimals  // maxFee uint256 in word 5
@@ -246,7 +247,8 @@ export function decodeDepositForBurn(data, decimals) {
 export function decodeMessageReceived(data) {
   try {
     const raw = data.startsWith('0x') ? data.slice(2) : data
-    const sourceDomain = Number(BigInt('0x' + (raw.slice(0, 64) || '0')))
+    if (raw.length < 64) return null
+    const sourceDomain = Number(BigInt('0x' + raw.slice(0, 64)))
     return { sourceDomain }
   } catch { return null }
 }

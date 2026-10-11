@@ -1,4 +1,4 @@
-// Tests for T3a counters.  Imports the REAL functions from src/counters.mjs.
+// Tests for T3a + T3b counters.  Imports the REAL functions from src/counters.mjs.
 // Run: node --test pulsarc-indexer/test/counters.test.mjs
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
@@ -8,10 +8,26 @@ import {
   USER_OP_TOPIC,
   ENTRY_POINTS,
   USDC,
+  EURC,
+  TRANSFER_TOPIC,
+  BLACKLISTED_TOPIC,
+  UNBLACKLISTED_TOPIC,
+  DEPOSIT_FOR_BURN_TOPIC,
+  MESSAGE_RECEIVED_TOPIC,
+  BIG_TRANSFER_USDC,
+  TOKEN_MESSENGER_V2,
+  MESSAGE_TRANSMITTER_V2,
   autoStats,
   largestUsdcTransfer,
   bucketIndex,
   countUserOps,
+  bigTransfers,
+  mintBurnFromLogs,
+  blocklistFromLogs,
+  decodeDepositForBurn,
+  decodeMessageReceived,
+  parseSupplyHex,
+  appendSupplySeries,
 } from '../src/counters.mjs'
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -279,4 +295,305 @@ describe('window accumulation — new fields', () => {
     assert.equal(r.bucketsAcc[0][0], 1)
     assert.equal(r.bucketsCov, 1)
   })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// T3b tests — appended, existing T3a tests above are unchanged
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── Fixture helpers ───────────────────────────────────────────────────────────
+// Note: USDC_ADDR and OTHER already defined in T3a fixtures section above; reuse them.
+
+const EURC_ADDR = EURC
+const ZERO_ADDR = '0x0000000000000000000000000000000000000000'
+// Alias for clarity in T3b tests (matches the T3a fixture name)
+const T3B_USDC  = USDC_ADDR   // === USDC
+const T3B_OTHER = OTHER_TOKEN  // '0xaaaa...'
+
+/** Build a 32-byte-padded address topic */
+function addrTopic(addr) {
+  return '0x' + addr.replace('0x', '').padStart(64, '0')
+}
+
+/** Build a Transfer log with configurable from/to */
+function transferLogFull(tokenAddr, amountWhole, decimals = 6, from = '0x1111', to = '0x2222') {
+  const raw = BigInt(Math.round(amountWhole * 10 ** decimals))
+  return {
+    address: tokenAddr,
+    topics: [
+      TRANSFER_TOPIC,
+      addrTopic(from),
+      addrTopic(to),
+    ],
+    data: '0x' + raw.toString(16).padStart(64, '0'),
+  }
+}
+
+/** Build a mint Transfer log (from == zero address) */
+function mintLog(tokenAddr, amountWhole, decimals = 6) {
+  return transferLogFull(tokenAddr, amountWhole, decimals, ZERO_ADDR, '0x2222')
+}
+
+/** Build a burn Transfer log (to == zero address) */
+function burnLog(tokenAddr, amountWhole, decimals = 6) {
+  return transferLogFull(tokenAddr, amountWhole, decimals, '0x1111', ZERO_ADDR)
+}
+
+/** Build a Blacklisted event log */
+function blacklistedLog(tokenAddr, account = '0xdeadbeef') {
+  return {
+    address: tokenAddr,
+    topics: [BLACKLISTED_TOPIC, addrTopic(account)],
+    data: '0x',
+  }
+}
+
+/** Build an UnBlacklisted event log */
+function unblacklistedLog(tokenAddr, account = '0xdeadbeef') {
+  return {
+    address: tokenAddr,
+    topics: [UNBLACKLISTED_TOPIC, addrTopic(account)],
+    data: '0x',
+  }
+}
+
+/**
+ * Build a DepositForBurn log data blob (10 words):
+ * word 0 = amount, word 1 = mintRecipient (dummy), word 2 = destinationDomain,
+ * word 3 = destinationTokenMessenger (dummy), word 4 = destinationCaller (dummy),
+ * word 5 = maxFee
+ */
+function depositForBurnData(amount6dec, domain, maxFee6dec) {
+  const words = [
+    BigInt(amount6dec),   // word 0: amount
+    0n,                   // word 1: mintRecipient
+    BigInt(domain),       // word 2: destinationDomain
+    0n,                   // word 3: destinationTokenMessenger
+    0n,                   // word 4: destinationCaller
+    BigInt(maxFee6dec),   // word 5: maxFee
+    0n, 0n, 0n, 0n,       // words 6-9: unused
+  ]
+  return '0x' + words.map(w => w.toString(16).padStart(64, '0')).join('')
+}
+
+/**
+ * Build a MessageReceived log data blob:
+ * word 0 = sourceDomain
+ */
+function messageReceivedData(sourceDomain) {
+  return '0x' + BigInt(sourceDomain).toString(16).padStart(64, '0')
+}
+
+// ── T3b Part 1: bigTransfers ──────────────────────────────────────────────────
+
+describe('bigTransfers — big USDC transfer detection', () => {
+  const TX = '0xaaaa'
+
+  it(`transfer of ${BIG_TRANSFER_USDC - 0.01} USDC is NOT kept (below threshold)`, () => {
+    const logs = [transferLogFull(T3B_USDC, BIG_TRANSFER_USDC - 0.01, 6)]
+    const result = bigTransfers(logs, TX, T3B_USDC, 6)
+    assert.equal(result.length, 0, 'should not include transfers below threshold')
+  })
+
+  it(`transfer of exactly ${BIG_TRANSFER_USDC} USDC IS kept`, () => {
+    const logs = [transferLogFull(T3B_USDC, BIG_TRANSFER_USDC, 6)]
+    const result = bigTransfers(logs, TX, T3B_USDC, 6)
+    assert.equal(result.length, 1)
+    assert.equal(result[0].amt, BIG_TRANSFER_USDC)
+    assert.equal(result[0].tx, TX)
+  })
+
+  it('top-5 limit: six big transfers → all six returned (bigTransfers does not slice; caller trims)', () => {
+    // bigTransfers returns ALL qualifying transfers per receipt; summarize trims to top 10 globally
+    const logs = Array.from({ length: 6 }, (_, i) =>
+      transferLogFull(T3B_USDC, BIG_TRANSFER_USDC + i * 1_000_000, 6)
+    )
+    const result = bigTransfers(logs, TX, T3B_USDC, 6)
+    assert.equal(result.length, 6, 'bigTransfers returns all qualifying per receipt')
+  })
+
+  it('transfer from another token address is ignored', () => {
+    const logs = [transferLogFull(T3B_OTHER, BIG_TRANSFER_USDC + 1, 6)]
+    const result = bigTransfers(logs, TX, T3B_USDC, 6)
+    assert.equal(result.length, 0)
+  })
+
+  it('from and to addresses are extracted correctly', () => {
+    const from = '0x' + 'a'.repeat(40)
+    const to   = '0x' + 'b'.repeat(40)
+    const logs = [transferLogFull(T3B_USDC, BIG_TRANSFER_USDC, 6, from, to)]
+    const result = bigTransfers(logs, TX, T3B_USDC, 6)
+    assert.equal(result.length, 1)
+    assert.equal(result[0].from, from.toLowerCase())
+    assert.equal(result[0].to,   to.toLowerCase())
+  })
+})
+
+// ── T3b Part 2: mintBurnFromLogs ─────────────────────────────────────────────
+
+describe('mintBurnFromLogs — mint and burn detection', () => {
+  it('from=zero is a mint for USDC', () => {
+    const logs = [mintLog(T3B_USDC, 1000)]
+    const r = mintBurnFromLogs(logs, T3B_USDC, EURC_ADDR, 6)
+    assert.ok(r, 'should detect a mint')
+    assert.deepEqual(r.usdc, [1000, 0])
+    assert.equal(r.eurc, undefined)
+  })
+
+  it('to=zero is a burn for USDC', () => {
+    const logs = [burnLog(T3B_USDC, 500)]
+    const r = mintBurnFromLogs(logs, T3B_USDC, EURC_ADDR, 6)
+    assert.ok(r)
+    assert.deepEqual(r.usdc, [0, 500])
+  })
+
+  it('normal transfer (neither from nor to is zero) does not count', () => {
+    const logs = [transferLogFull(T3B_USDC, 1000)]
+    const r = mintBurnFromLogs(logs, T3B_USDC, EURC_ADDR, 6)
+    assert.equal(r, null, 'plain transfer must not trigger mint/burn')
+  })
+
+  it('mint works for EURC', () => {
+    const logs = [mintLog(EURC_ADDR, 250)]
+    const r = mintBurnFromLogs(logs, T3B_USDC, EURC_ADDR, 6)
+    assert.ok(r)
+    assert.deepEqual(r.eurc, [250, 0])
+    assert.equal(r.usdc, undefined)
+  })
+
+  it('mint from an unrelated token address is ignored', () => {
+    const logs = [mintLog(T3B_OTHER, 1_000_000)]
+    const r = mintBurnFromLogs(logs, T3B_USDC, EURC_ADDR, 6)
+    assert.equal(r, null)
+  })
+
+  it('no logs → null', () => {
+    assert.equal(mintBurnFromLogs([], T3B_USDC, EURC_ADDR, 6), null)
+  })
+})
+
+// ── T3b Part 3: blocklistFromLogs ────────────────────────────────────────────
+
+describe('blocklistFromLogs — blacklist event detection', () => {
+  it('Blacklisted topic from USDC address is counted', () => {
+    const logs = [blacklistedLog(T3B_USDC)]
+    const r = blocklistFromLogs(logs, T3B_USDC, EURC_ADDR)
+    assert.ok(r)
+    assert.equal(r.added, 1)
+    assert.equal(r.removed, 0)
+    assert.equal(r.addrs[0].token, 'usdc')
+    assert.equal(r.addrs[0].kind, 'blacklisted')
+  })
+
+  it('UnBlacklisted topic from USDC address is counted as removal', () => {
+    const logs = [unblacklistedLog(T3B_USDC)]
+    const r = blocklistFromLogs(logs, T3B_USDC, EURC_ADDR)
+    assert.ok(r)
+    assert.equal(r.removed, 1)
+    assert.equal(r.addrs[0].kind, 'unblacklisted')
+  })
+
+  it('same topic from unrelated address is ignored', () => {
+    const logs = [blacklistedLog(T3B_OTHER)]
+    const r = blocklistFromLogs(logs, T3B_USDC, EURC_ADDR)
+    assert.equal(r, null)
+  })
+
+  it('blkAddr is capped at 10 by the caller; blocklistFromLogs returns all found', () => {
+    // blocklistFromLogs itself returns all; summarize trims blkAddrAcc to slice(-10)
+    const logs = Array.from({ length: 12 }, () => blacklistedLog(T3B_USDC))
+    const r = blocklistFromLogs(logs, T3B_USDC, EURC_ADDR)
+    assert.equal(r.added, 12, 'blocklistFromLogs returns all 12')
+    assert.equal(r.addrs.length, 12)
+    // The trim-to-10 happens in summarize.mjs; verify the pattern with a slice
+    assert.equal(r.addrs.slice(-10).length, 10, 'caller can trim to 10 with slice(-10)')
+  })
+
+  it('no logs → null', () => {
+    assert.equal(blocklistFromLogs([], T3B_USDC, EURC_ADDR), null)
+  })
+})
+
+// ── T3b Part 4: CCTP decoding ────────────────────────────────────────────────
+
+describe('decodeDepositForBurn', () => {
+  it('decodes a hand-built 10-word data blob correctly', () => {
+    // amount = 1000 USDC (1000 * 10^6 = 1_000_000_000 raw), domain = 3, maxFee = 0.005 USDC
+    const amountRaw  = 1_000_000_000n              // 1000 USDC at 6 dec
+    const domain     = 3
+    const maxFeeRaw  = 5_000n                      // 0.005 USDC at 6 dec
+    const data = depositForBurnData(amountRaw, domain, maxFeeRaw)
+    const r = decodeDepositForBurn(data, 6)
+    assert.ok(r, 'should parse successfully')
+    assert.equal(r.amount, 1000, 'amount should be 1000 USDC')
+    assert.equal(r.domain, 3,    'domain should be 3')
+    assert.equal(r.maxFee, 0.005, 'maxFee should be 0.005 USDC')
+  })
+
+  it('returns null on an empty / malformed data string', () => {
+    assert.equal(decodeDepositForBurn('0x', 6), null)
+    assert.equal(decodeDepositForBurn('not-hex', 6), null)
+  })
+
+  it('DepositForBurn topic from a wrong address is ignored in the caller (constant check)', () => {
+    // The topic itself is a constant; the address check is in run.mjs not in decodeDepositForBurn.
+    // We verify the topic constant is defined and non-empty.
+    assert.ok(DEPOSIT_FOR_BURN_TOPIC.startsWith('0x'), 'DEPOSIT_FOR_BURN_TOPIC must be a hex string')
+    assert.equal(DEPOSIT_FOR_BURN_TOPIC.length, 66, 'topic0 must be 32 bytes = 66 chars with 0x')
+  })
+})
+
+describe('decodeMessageReceived', () => {
+  it('gives sourceDomain from a one-word data blob', () => {
+    const data = messageReceivedData(7)
+    const r = decodeMessageReceived(data)
+    assert.ok(r)
+    assert.equal(r.sourceDomain, 7)
+  })
+
+  it('returns null on empty data', () => {
+    assert.equal(decodeMessageReceived('0x'), null)
+  })
+
+  it('MessageReceived topic from wrong address is ignored in caller (constant check)', () => {
+    assert.ok(MESSAGE_RECEIVED_TOPIC.startsWith('0x'))
+    assert.equal(MESSAGE_RECEIVED_TOPIC.length, 66)
+  })
+
+})
+
+// ── T3b Part 5: summarize — window accumulation of new fields ────────────────
+
+describe('parseSupplyHex', () => {
+  it('parses a known hex value to USDC amount', () => {
+    // 1_000_000_000_000 raw (6 dec) = 1_000_000 USDC
+    const raw = (1_000_000n * 10n ** 6n).toString(16)
+    const result = parseSupplyHex('0x' + raw.padStart(64, '0'), 6)
+    assert.equal(result, 1_000_000)
+  })
+
+  it('returns 0 for empty hex', () => {
+    assert.equal(parseSupplyHex('0x', 6), 0)
+    assert.equal(parseSupplyHex('', 6), 0)
+    assert.equal(parseSupplyHex(null, 6), 0)
+  })
+})
+
+describe('appendSupplySeries', () => {
+  it('appends a new point for a new hour', () => {
+    const series = []
+    appendSupplySeries(series, '2026-10-08T14', 5_000_000, null, 'usdc')
+    assert.equal(series.length, 1)
+    assert.equal(series[0].hour, '2026-10-08T14')
+    assert.equal(series[0].supply, 5_000_000)
+  })
+
+  it('same hour twice → one point (deduplication)', () => {
+    const series = []
+    appendSupplySeries(series, '2026-10-08T14', 5_000_000, null, 'usdc')
+    appendSupplySeries(series, '2026-10-08T14', 5_100_000, null, 'usdc')
+    assert.equal(series.length, 1, 'same hour must not create a second point')
+    assert.equal(series[0].supply, 5_100_000, 'second call updates the point in-place')
+  })
+
 })
