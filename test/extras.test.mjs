@@ -169,7 +169,7 @@ describe('notify', () => {
   it('builds one message per new item and remembers it', () => {
     const p = planNotifications(anomalies, {})
     assert.equal(p.messages.length, 2)
-    assert.match(p.messages[0], /^usdc on Arc: 3\.1x its usual activity\. 12,400 transactions/)
+    assert.match(p.messages[0], /^USDC on Arc: 3\.1x its usual activity\. 12,400 transactions/)
     assert.match(p.messages[1], /down 80%/)
     assert.match(p.messages[0], /https:\/\/pulsarc\.vercel\.app\/dapp\/usdc$/)
     assert.deepEqual(p.state.sent, ['2026-10-10T11:usdc:spike', '2026-10-10T11:eurc:drop'])

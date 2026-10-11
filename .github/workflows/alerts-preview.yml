@@ -1,0 +1,45 @@
+name: alerts-preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      net:
+        description: Network (testnet or mainnet)
+        required: true
+        default: testnet
+        type: choice
+        options:
+          - testnet
+          - mainnet
+
+permissions:
+  contents: read   # read-only; never pushes
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore data branch (read-only)
+        run: |
+          if git ls-remote --exit-code --heads origin data >/dev/null 2>&1; then
+            git clone --quiet --depth 1 --branch data "https://github.com/${GITHUB_REPOSITORY}.git" data
+            rm -rf data/.git
+          else
+            mkdir -p data
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run extras in dry-run mode
+        env:
+          NET: ${{ inputs.net }}
+          NOTIFY_DRY_RUN: '1'
+          NOTIFY_KINDS: anomaly,daily,health,rank,contract,agents,weekly
+          # TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are intentionally NOT passed
+        run: node src/extras.mjs
+        working-directory: pulsarc-indexer

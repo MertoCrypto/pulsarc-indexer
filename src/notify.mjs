@@ -3,56 +3,44 @@
 // planNotifications(anomalies, prev, opts) is pure: it decides which anomaly items are new,
 // builds the message text and returns the next state. The caller sends and writes files.
 // State (data/<net>/notified.json): { sent: ['<hour>:<app>:<kind>'], feed: [{ id, title, link, date }] }.
+//
+// This module re-exports the backward-compatible API; the real logic lives in alerts.mjs.
 
+export { SITE as CFG_SITE, fmtN } from './alerts.mjs'
+import { planAlerts, SITE } from './alerts.mjs'
+
+// Keep CFG for any callers that import it
 export const CFG = {
-  maxPerRun: 3,     // never more than this many messages for one hour
-  keepSent: 200,    // dedupe memory
-  keepFeed: 50,     // RSS items
-  site: 'https://pulsarc.vercel.app',
+  maxPerRun: 3,
+  keepSent: 200,
+  keepFeed: 50,
+  site: SITE,
 }
 
 const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
-const num = (n) => Number(n).toLocaleString('en-US')
 
 export function describe(item, network) {
   const net = network === 'mainnet' ? 'Arc' : 'Arc Testnet'
   if (item.kind === 'spike') {
+    const num = (n) => Number(n).toLocaleString('en-US')
     return `${item.app} on ${net}: ${item.ratio}x its usual activity. ${num(item.txs)} transactions in the last hour, the 24h median is ${num(item.baseline)}.`
   }
+  const num = (n) => Number(n).toLocaleString('en-US')
   const pct = Math.round((1 - item.ratio) * 100)
   return `${item.app} on ${net}: down ${pct}% from its usual activity. ${num(item.txs)} transactions in the last hour, the 24h median is ${num(item.baseline)}.`
 }
 
+/**
+ * Backward-compatible wrapper: planNotifications(anomalies, prev, opts)
+ * Delegates to planAlerts with only the anomaly kind enabled.
+ */
 export function planNotifications(anomalies, prev = {}, opts = {}) {
-  const cfg = { ...CFG, ...opts }
-  const sent = Array.isArray(prev.sent) ? prev.sent : []
-  const feed = Array.isArray(prev.feed) ? prev.feed : []
-  const out = { messages: [], state: { sent, feed } }
-  if (!anomalies || anomalies.status !== 'ok' || !anomalies.hour || !Array.isArray(anomalies.items)) return out
-
-  const seen = new Set(sent)
-  const fresh = []
-  for (const item of anomalies.items) {
-    if (!/^[a-z0-9-]{1,40}$/.test(item.app ?? '')) continue // app ids come from our own list; anything else is dropped
-    const id = `${anomalies.hour}:${item.app}:${item.kind}`
-    if (seen.has(id)) continue
-    fresh.push({ id, item })
-    if (fresh.length >= cfg.maxPerRun) break
-  }
-  if (!fresh.length) return out
-
-  const network = anomalies.network === 'testnet' ? 'testnet' : 'mainnet'
-  const date = new Date(Date.parse(`${anomalies.hour}:00:00Z`) + 3_600_000).toISOString()
-  const entries = fresh.map(({ id, item }) => {
-    const link = `${cfg.site}/dapp/${item.app}`
-    return { id, title: describe(item, network), link, date }
-  })
-  out.messages = entries.map((e) => `${e.title}\n${e.link}`)
-  out.state = {
-    sent: [...sent, ...entries.map((e) => e.id)].slice(-cfg.keepSent),
-    feed: [...entries.reverse(), ...feed].slice(0, cfg.keepFeed),
-  }
-  return out
+  const result = planAlerts(
+    { anomalies, network: anomalies?.network ?? 'mainnet' },
+    prev,
+    { enabledKinds: new Set(['anomaly']), now: Date.now(), ...opts },
+  )
+  return { messages: result.messages, state: result.state }
 }
 
 export function renderRss(feed, network, opts = {}) {
