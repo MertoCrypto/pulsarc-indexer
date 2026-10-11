@@ -182,7 +182,10 @@ export async function publish({ pendingPath, outDir, today, net }) {
   for (const [k, v] of Object.entries(pending.days)) {
     if (!publishedSet.has(k)) newDays[k] = v
   }
-  const newPending = { version: 1, dropped: pending.dropped ?? 0, days: newDays }
+  // Preserve startBlock and any other unknown top-level keys from the original pending file.
+  // Only version, dropped, and days are managed here; everything else is carried through.
+  const { version: _v, dropped: _d, days: _dy, ...extraKeys } = pending
+  const newPending = { version: 1, dropped: pending.dropped ?? 0, ...extraKeys, days: newDays }
   await writeJsonAtomic(pendingPath, newPending)
 
   return { publishedDays, touchedShards, newWallets, throughDay: newThrough }

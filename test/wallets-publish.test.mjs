@@ -352,6 +352,39 @@ describe('publish — walletCount increments across calls', () => {
   })
 })
 
+describe('publish — startBlock is preserved after removing published days', () => {
+  it('startBlock survives a publish() call', async () => {
+    const dir = tmpDir()
+    const outDir = join(dir, 'out')
+    const pendingPath = join(dir, 'wallets-pending.json')
+
+    // Write a pending file that includes startBlock
+    const pending = { ...makePending({ 5: { [ADDR_A]: enc(5, 2) } }), startBlock: 12345 }
+    await writeJson(pendingPath, pending)
+
+    await publish({ pendingPath, outDir, today: 6, net: NET })
+
+    const after = await readJson(pendingPath)
+    assert.equal(after?.startBlock, 12345, `startBlock must be preserved; got ${after?.startBlock}`)
+  })
+
+  it('extra unknown top-level keys survive a publish() call', async () => {
+    const dir = tmpDir()
+    const outDir = join(dir, 'out')
+    const pendingPath = join(dir, 'wallets-pending.json')
+
+    // A pending file with an unknown key the publisher does not know about
+    const pending = { ...makePending({ 3: { [ADDR_B]: enc(3, 1) } }), startBlock: 99, _future: 'keep-me' }
+    await writeJson(pendingPath, pending)
+
+    await publish({ pendingPath, outDir, today: 4, net: NET })
+
+    const after = await readJson(pendingPath)
+    assert.equal(after?.startBlock, 99, 'startBlock must be kept')
+    assert.equal(after?._future, 'keep-me', '_future unknown key must be kept')
+  })
+})
+
 describe('publish CLI — smoke test via execFile', () => {
   it('exits 0 on nothing to do, prints summary line', async () => {
     const dir = tmpDir()

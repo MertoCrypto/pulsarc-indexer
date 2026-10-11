@@ -139,6 +139,35 @@ server.listen(0, '127.0.0.1', async () => {
     check('WALLET_INDEX=1: same total t across single/sliced', tot1.t === tot2.t, `(${tot1.t} vs ${tot2.t})`)
     check('WALLET_INDEX=1: same total x across single/sliced', tot1.x === tot2.x, `(${tot1.x} vs ${tot2.x})`)
     check('WALLET_INDEX=1: tx count matches hourly total', tot1.t === (TIP + 1) * 2, `(t=${tot1.t} expected ${(TIP + 1) * 2})`)
+
+    // T5a: startBlock tests
+    // Both single run and sliced run must have startBlock = seed.next (block 0, the first accumulated block)
+    check('WALLET_INDEX=1: single run has startBlock set', typeof p1?.startBlock === 'number', `(startBlock=${p1?.startBlock})`)
+    check('WALLET_INDEX=1: sliced run has startBlock set', typeof p2?.startBlock === 'number', `(startBlock=${p2?.startBlock})`)
+    check('WALLET_INDEX=1: single run startBlock equals seed.next', p1?.startBlock === seed.next, `(startBlock=${p1?.startBlock} expected ${seed.next})`)
+    check('WALLET_INDEX=1: sliced run startBlock equals seed.next', p2?.startBlock === seed.next, `(startBlock=${p2?.startBlock} expected ${seed.next})`)
+    check('WALLET_INDEX=1: single and sliced startBlock agree', p1?.startBlock === p2?.startBlock, `(${p1?.startBlock} vs ${p2?.startBlock})`)
+
+    // A second run on the same folder must keep startBlock unchanged
+    const W3 = sandbox(seed)
+    await run(W3, walletEnv)                                      // first run sets startBlock
+    const pBefore = readPending(W3)
+    await run(W3, walletEnv)                                      // second run — cursor is already at tip
+    const pAfter = readPending(W3)
+    check('WALLET_INDEX=1: second run keeps startBlock unchanged', pAfter?.startBlock === pBefore?.startBlock, `(before=${pBefore?.startBlock} after=${pAfter?.startBlock})`)
+
+    // A pending file written without startBlock (older run) must leave startBlock absent after a new run
+    const W4 = sandbox(seed)
+    await run(W4, walletEnv)                                      // creates the pending file with startBlock
+    const pOld = readPending(W4)
+    const { startBlock: _sb, ...pOldWithout } = pOld             // strip startBlock to simulate older run
+    writeFileSync(pendingPath(W4), JSON.stringify(pOldWithout))  // overwrite with legacy format
+    // Run again from same cursor (at tip already; just force a no-block-progress run)
+    await run(W4, walletEnv)
+    const pLegacy = readPending(W4)
+    // After loading a legacy file (no startBlock) and processing no new blocks, the
+    // key is either absent or null — either way it must NOT be promoted to a block number.
+    check('WALLET_INDEX=1: legacy pending keeps startBlock absent or null', !('startBlock' in (pLegacy ?? {})) || pLegacy?.startBlock === null, `(startBlock=${JSON.stringify(pLegacy?.startBlock)})`)
   }
 
   // 7. a pruned endpoint answering with empty receipts must be rejected, not indexed as "0 transactions"

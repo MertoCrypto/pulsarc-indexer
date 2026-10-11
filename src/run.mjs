@@ -99,6 +99,14 @@ let walletDropped = 0
 let walletCappedWarned = false
 let walletAppIndex = new Map()  // built once in main()
 
+/**
+ * The first block number accumulated into the wallet index this index lifetime.
+ * Set once on the first accumulated block when the pending file has no startBlock.
+ * null means "unknown" (pending file was written by an older run without startBlock).
+ * undefined means "not yet set this run" (pending file was absent or had no startBlock).
+ */
+let walletStartBlock = undefined
+
 // Build the endpoint rotation list from env or defaults
 function buildEndpoints() {
   if (process.env.RPC_URLS) {
@@ -390,6 +398,17 @@ async function loadWalletPending() {
     return
   }
   walletDropped = raw.dropped ?? 0
+  // Restore startBlock.
+  //   integer  → loaded from a previous run that knew where it started.
+  //   null     → file had no startBlock (older run); we cannot know the real start.
+  //   (key absent in a valid file) → treat as null (same: older run, unknown start).
+  //   undefined → only when the file was completely absent (ENOENT); first block sets it.
+  if ('startBlock' in raw) {
+    walletStartBlock = raw.startBlock  // integer or null
+  } else {
+    // Valid file but no startBlock key: older run; mark as unknown rather than guessing.
+    walletStartBlock = null
+  }
   for (const [dayStr, shardObj] of Object.entries(raw.days)) {
     const day = Number(dayStr)
     const map = new Map()
@@ -421,7 +440,10 @@ async function saveWalletPending() {
   }
   const tmp = PENDING_PATH + '.tmp'
   await mkdir(dirname(PENDING_PATH), { recursive: true })
-  await writeFile(tmp, JSON.stringify({ version: 1, dropped: walletDropped, days }))
+  // Persist startBlock only when it has been positively established (integer).
+  // undefined means "never set yet" (no key); null means "was absent in an older run" (write null).
+  const startBlockEntry = walletStartBlock !== undefined ? { startBlock: walletStartBlock } : {}
+  await writeFile(tmp, JSON.stringify({ version: 1, dropped: walletDropped, ...startBlockEntry, days }))
   await rename(tmp, PENDING_PATH)
 }
 
@@ -431,8 +453,15 @@ async function saveWalletPending() {
  * @param {object[]} receipts   eth_getBlockReceipts result
  * @param {number}   blockTs    block.timestamp as a number (seconds)
  * @param {number}   usdcDec    USDC decimals
+ * @param {number}   blockNum   block number (used to record startBlock on first call)
  */
-function accumulateWalletBlock(receipts, blockTs, usdcDec) {
+function accumulateWalletBlock(receipts, blockTs, usdcDec, blockNum) {
+  // Record the first block number seen when startBlock has not been set yet.
+  // undefined = never loaded from file (fresh index or file was absent).
+  // Only set it to an integer; once set (integer or null) never change it.
+  if (walletStartBlock === undefined) {
+    walletStartBlock = blockNum
+  }
   const day = walletDayOf(blockTs)
   if (!walletDays.has(day)) walletDays.set(day, new Map())
   const dayMap = walletDays.get(day)
@@ -627,7 +656,7 @@ async function apply(blockNumbers, out, open) {
     // ── Wallet index (feature-flagged) ──
     if (WALLET_INDEX && receipts.length) {
       const usdcDec = metaCache.decimals[USDC] ?? 6
-      accumulateWalletBlock(receipts, num(block.timestamp), usdcDec)
+      accumulateWalletBlock(receipts, num(block.timestamp), usdcDec, blockNumbers[i])
     }
   }
 }
