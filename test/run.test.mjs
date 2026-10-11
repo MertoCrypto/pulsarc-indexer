@@ -33,7 +33,10 @@ const server = http.createServer((req, res) => {
 
 function sandbox(state) {
   const d = mkdtempSync(join(tmpdir(), 'idx-'))
-  mkdirSync(join(d, 'src')); cpSync(join(SRC, 'run.mjs'), join(d, 'src', 'run.mjs')); cpSync(join(SRC, 'apps.mjs'), join(d, 'src', 'apps.mjs')); cpSync(join(SRC, 'counters.mjs'), join(d, 'src', 'counters.mjs'))
+  mkdirSync(join(d, 'src'))
+  cpSync(join(SRC, 'run.mjs'),      join(d, 'src', 'run.mjs'))
+  cpSync(join(SRC, 'apps.mjs'),     join(d, 'src', 'apps.mjs'))
+  cpSync(join(SRC, 'counters.mjs'), join(d, 'src', 'counters.mjs'))
   writeFileSync(join(d, 'apps.testnet.json'), JSON.stringify({ apps: [{ id: 'tok', anchors: [{ address: '0xdd', kind: 'token', usd: true }] }, { id: 'ctr', anchors: [{ address: '0xc0', kind: 'contract' }] }] }))
   if (state) { mkdirSync(join(d, 'data', 'testnet'), { recursive: true }); writeFileSync(join(d, 'data', 'testnet', 'state.json'), JSON.stringify(state)) }
   return d

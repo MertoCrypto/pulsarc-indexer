@@ -39,7 +39,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID }}
           NOTIFY_NETS: mainnet
           NOTIFY_KINDS: anomaly
-        run: NET=mainnet BUDGET_SECONDS=1200 node src/run.mjs && NET=mainnet node src/summarize.mjs && NET=mainnet node src/label.mjs && NET=mainnet node src/extras.mjs
+        run: NET=mainnet BUDGET_SECONDS=1200 node src/run.mjs && NET=mainnet node src/summarize.mjs && NET=mainnet node src/supply.mjs && NET=mainnet node src/label.mjs && NET=mainnet node src/extras.mjs
 
       - name: Index Arc Testnet
         env:
@@ -47,7 +47,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID }}
           NOTIFY_NETS: testnet
           NOTIFY_KINDS: anomaly,daily,health,rank,contract,agents,weekly
-        run: NET=testnet BUDGET_SECONDS=300 BACKFILL_HOURS=24 node src/run.mjs && NET=testnet node src/summarize.mjs && NET=testnet node src/label.mjs && NET=testnet node src/extras.mjs
+        run: NET=testnet BUDGET_SECONDS=300 BACKFILL_HOURS=24 node src/run.mjs && NET=testnet node src/summarize.mjs && NET=testnet node src/supply.mjs && NET=testnet node src/label.mjs && NET=testnet node src/extras.mjs
 
       - name: Publish snapshot
         run: ./scripts/publish.sh

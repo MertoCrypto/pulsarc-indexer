@@ -32,6 +32,14 @@ function windowSummary(keys, hours) {
   let aa = 0, aaTx = 0
   let autoCoverageHours = 0, bucketsCoverageHours = 0
   const bucketsAcc = [[0, 0], [0, 0], [0, 0]]  // [count, vol] per band
+  // T3b accumulators
+  const bigAll = []                   // Part 1: all big transfers, trimmed to top 10
+  const mbAcc = {}                    // Part 2: { usdc?: [m,b], eurc?: [m,b] }
+  let mbCoverageHours = 0
+  let blkAdded = 0, blkRemoved = 0
+  const blkAddrAcc = []               // Part 3: latest 10 across window
+  const bridgeAcc = { out: [0, 0, 0], in: [0], byDomain: {} }  // Part 4
+  let bridgeCoverageHours = 0
   const contracts = new Map()
   for (const k of keys) {
     const h = hours[k]
@@ -56,6 +64,37 @@ function windowSummary(keys, hours) {
       }
       bucketsCoverageHours++
     }
+    // T3b Part 1: big transfers — collect all, trim later
+    if (h.big) for (const b of h.big) bigAll.push(b)
+    // T3b Part 2: mb (mint/burn)
+    if (h.mb) {
+      mbCoverageHours++
+      for (const token of ['usdc', 'eurc']) {
+        if (!h.mb[token]) continue
+        mbAcc[token] ??= [0, 0]
+        mbAcc[token][0] = +(mbAcc[token][0] + h.mb[token][0]).toFixed(2)
+        mbAcc[token][1] = +(mbAcc[token][1] + h.mb[token][1]).toFixed(2)
+      }
+    }
+    // T3b Part 3: blocklist
+    if (h.blk) {
+      blkAdded   += h.blk[0]
+      blkRemoved += h.blk[1]
+    }
+    if (h.blkAddr) for (const e of h.blkAddr) blkAddrAcc.push(e)
+    // T3b Part 4: bridge
+    if (h.bridge) {
+      bridgeCoverageHours++
+      bridgeAcc.out[0] += h.bridge.out[0]
+      bridgeAcc.out[1]  = +(bridgeAcc.out[1] + h.bridge.out[1]).toFixed(2)
+      bridgeAcc.out[2]  = +(bridgeAcc.out[2] + h.bridge.out[2]).toFixed(6)
+      bridgeAcc.in[0]  += h.bridge.in[0]
+      for (const [dom, vals] of Object.entries(h.bridge.byDomain ?? {})) {
+        bridgeAcc.byDomain[dom] ??= [0, 0]
+        bridgeAcc.byDomain[dom][0] += vals[0]
+        bridgeAcc.byDomain[dom][1]  = +(bridgeAcc.byDomain[dom][1] + vals[1]).toFixed(2)
+      }
+    }
     for (const [addr, tx, wallets, fee] of h.top ?? []) {
       const c = contracts.get(addr) ?? { address: addr, txs: 0, walletHours: 0, fees: 0 }
       c.txs += tx
@@ -78,6 +117,24 @@ function windowSummary(keys, hours) {
     result.buckets             = bucketsAcc
     result.bucketsCoverageHours = bucketsCoverageHours
   }
+  // T3b: add new fields only when present
+  if (bigAll.length > 0) {
+    bigAll.sort((a, b) => b.amt - a.amt)
+    result.big = bigAll.slice(0, 10)
+  }
+  if (Object.keys(mbAcc).length > 0) {
+    result.mb = mbAcc
+    result.mbCoverageHours = mbCoverageHours
+  }
+  if (blkAdded > 0 || blkRemoved > 0) {
+    result.blk = [blkAdded, blkRemoved]
+    // Keep latest 10 blkAddr entries across the window
+    result.blkAddr = blkAddrAcc.slice(-10)
+  }
+  if (bridgeCoverageHours > 0) {
+    result.bridge = bridgeAcc
+    result.bridgeCoverageHours = bridgeCoverageHours
+  }
   return result
 }
 
@@ -95,6 +152,30 @@ out.series = keys.slice(-168).map((k) => {
 })
 await writeFile(join(ROOT, 'latest.json'), JSON.stringify(out))
 console.log(`${NET}: summary over ${keys.length} hours`)
+
+// ── bridge.json ─────────────────────────────────────────────────────────────
+{
+  const bridgeOut = {
+    network: NET,
+    generatedAt: new Date().toISOString(),
+    windows: {},
+    series: keys.slice(-168).map((k) => {
+      const h = hours[k]
+      return {
+        hour: k,
+        outCount: h.bridge?.out[0] ?? 0,
+        outUsdc:  h.bridge?.out[1] ?? 0,
+        inCount:  h.bridge?.in[0]  ?? 0,
+      }
+    }),
+  }
+  for (const [name, n] of Object.entries(WINDOWS)) {
+    const w = out.windows[name]
+    bridgeOut.windows[name] = w.bridge ?? { out: [0, 0, 0], in: [0], byDomain: {} }
+  }
+  await writeFile(join(ROOT, 'bridge.json'), JSON.stringify(bridgeOut))
+  console.log(`${NET}: bridge.json written`)
+}
 
 // ── apps-latest.json ────────────────────────────────────────────────────────
 // Load app config; if absent or empty, write an empty apps-latest.json and skip.

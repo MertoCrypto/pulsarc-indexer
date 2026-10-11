@@ -16,7 +16,15 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { accumulateApps, compactApps } from './apps.mjs'
-import { AUTO_TX_PER_HOUR, USER_OP_TOPIC, ENTRY_POINTS, USDC, autoStats, largestUsdcTransfer, bucketIndex, countUserOps } from './counters.mjs'
+import {
+  AUTO_TX_PER_HOUR, USER_OP_TOPIC, ENTRY_POINTS, USDC, autoStats,
+  largestUsdcTransfer, bucketIndex, countUserOps,
+  // T3b
+  EURC, TOKEN_MESSENGER_V2, MESSAGE_TRANSMITTER_V2,
+  DEPOSIT_FOR_BURN_TOPIC, MESSAGE_RECEIVED_TOPIC,
+  bigTransfers, mintBurnFromLogs, blocklistFromLogs,
+  decodeDepositForBurn, decodeMessageReceived,
+} from './counters.mjs'
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
@@ -44,6 +52,10 @@ const NETWORKS = {
 }
 
 const NET = process.env.NET === 'testnet' ? 'testnet' : 'mainnet'
+
+// T3b: per-network contract addresses (lowercased)
+const TOKEN_MESSENGER_ADDR     = TOKEN_MESSENGER_V2[NET]
+const MESSAGE_TRANSMITTER_ADDR = MESSAGE_TRANSMITTER_V2[NET]
 const BACKFILL_HOURS = Number(process.env.BACKFILL_HOURS || 24)
 const BUDGET_MS = Number(process.env.BUDGET_SECONDS || 1200) * 1000
 const TOP_PER_HOUR = 400
@@ -279,6 +291,12 @@ async function loadOpen() {
     ...(saved.hour._aa      ? { _aa: saved.hour._aa }          : {}),
     ...(saved.hour._aaTx    ? { _aaTx: saved.hour._aaTx }      : {}),
     ...(saved.hour._buckets ? { _buckets: saved.hour._buckets } : {}),
+    // T3b: restore live fields (absent in old files = fine)
+    ...(saved.hour._big     ? { _big:     saved.hour._big     } : {}),
+    ...(saved.hour._mb      ? { _mb:      saved.hour._mb      } : {}),
+    ...(saved.hour._blk     ? { _blk:     saved.hour._blk     } : {}),
+    ...(saved.hour._blkAddr ? { _blkAddr: saved.hour._blkAddr } : {}),
+    ...(saved.hour._bridge  ? { _bridge:  saved.hour._bridge  } : {}),
   }
   reviveHour(h)
   // Restore contracts from _contracts (raw) if present, else they are lost (acceptable: re-accumulation starts fresh)
@@ -306,9 +324,15 @@ async function saveOpen(hk, hour, blockCursor) {
       _contracts: hour.contracts,
       _apps: dumpHour(hour).apps,
       // T3a fields — only written when non-zero to keep old hours small
-      ...(hour._aa   ? { _aa: hour._aa }     : {}),
-      ...(hour._aaTx ? { _aaTx: hour._aaTx } : {}),
+      ...(hour._aa      ? { _aa: hour._aa }         : {}),
+      ...(hour._aaTx    ? { _aaTx: hour._aaTx }     : {}),
       ...(hour._buckets ? { _buckets: hour._buckets } : {}),
+      // T3b fields
+      ...(hour._big     ? { _big:     hour._big     } : {}),
+      ...(hour._mb      ? { _mb:      hour._mb      } : {}),
+      ...(hour._blk     ? { _blk:     hour._blk     } : {}),
+      ...(hour._blkAddr ? { _blkAddr: hour._blkAddr } : {}),
+      ...(hour._bridge  ? { _bridge:  hour._bridge  } : {}),
     },
   })
 }
@@ -393,6 +417,76 @@ async function apply(blockNumbers, out, open) {
           b[idx][0]++
           b[idx][1] = +(b[idx][1] + largest).toFixed(2)
         }
+
+        // T3b Part 1: big transfers (>= BIG_TRANSFER_USDC)
+        const bigs = bigTransfers(r.logs ?? [], r.transactionHash ?? '', USDC, usdcDec)
+        for (const bt of bigs) {
+          const arr = h._big ?? (h._big = [])
+          arr.push(bt)
+          // Keep only top 5 by amount in the live accumulator to bound memory
+          arr.sort((a, b) => b.amt - a.amt)
+          if (arr.length > 5) arr.length = 5
+        }
+
+        // T3b Part 2: mint and burn (USDC + EURC)
+        const eurcDec = metaCache.decimals[EURC] ?? 6
+        const mb = mintBurnFromLogs(r.logs ?? [], USDC, EURC, Math.min(usdcDec, eurcDec))
+        if (mb) {
+          const acc = h._mb ?? (h._mb = {})
+          if (mb.usdc) {
+            acc.usdc ??= [0, 0]
+            acc.usdc[0] = +(acc.usdc[0] + mb.usdc[0]).toFixed(2)
+            acc.usdc[1] = +(acc.usdc[1] + mb.usdc[1]).toFixed(2)
+          }
+          if (mb.eurc) {
+            acc.eurc ??= [0, 0]
+            acc.eurc[0] = +(acc.eurc[0] + mb.eurc[0]).toFixed(2)
+            acc.eurc[1] = +(acc.eurc[1] + mb.eurc[1]).toFixed(2)
+          }
+        }
+
+        // T3b Part 3: blocklist events
+        const blk = blocklistFromLogs(r.logs ?? [], USDC, EURC)
+        if (blk) {
+          const ba = h._blk ?? (h._blk = [0, 0])
+          ba[0] += blk.added
+          ba[1] += blk.removed
+          const addrAcc = h._blkAddr ?? (h._blkAddr = [])
+          for (const entry of blk.addrs) {
+            addrAcc.push(entry)
+            if (addrAcc.length >= 10) break  // cap at 10 per hour
+          }
+        }
+
+        // T3b Part 4: CCTP bridge — outgoing (DepositForBurn from TokenMessenger)
+        for (const log of r.logs ?? []) {
+          if (!log.topics?.length) continue
+          if (log.address?.toLowerCase() === TOKEN_MESSENGER_ADDR &&
+              log.topics[0].toLowerCase() === DEPOSIT_FOR_BURN_TOPIC) {
+            const decoded = decodeDepositForBurn(log.data, usdcDec)
+            if (decoded) {
+              const br = h._bridge ?? (h._bridge = { out: [0, 0, 0], in: [0], byDomain: {} })
+              br.out[0]++
+              br.out[1] = +(br.out[1] + decoded.amount).toFixed(2)
+              br.out[2] = +(br.out[2] + decoded.maxFee).toFixed(6)
+              const dk = String(decoded.domain)
+              br.byDomain[dk] ??= [0, 0]
+              br.byDomain[dk][0]++
+              br.byDomain[dk][1] = +(br.byDomain[dk][1] + decoded.amount).toFixed(2)
+              // Keep at most 20 domains
+              const domKeys = Object.keys(br.byDomain)
+              if (domKeys.length > 20) {
+                const oldest = domKeys[0]; delete br.byDomain[oldest]
+              }
+            }
+          }
+          // T3b Part 4: CCTP bridge — incoming (MessageReceived from MessageTransmitter)
+          if (log.address?.toLowerCase() === MESSAGE_TRANSMITTER_ADDR &&
+              log.topics[0].toLowerCase() === MESSAGE_RECEIVED_TOPIC) {
+            const br = h._bridge ?? (h._bridge = { out: [0, 0, 0], in: [0], byDomain: {} })
+            br.in[0]++
+          }
+        }
       }
     }
     // ── App stats (v2) ──
@@ -426,6 +520,12 @@ function compact(h) {
   if (h._aaTx) { h.aaTx = h._aaTx; delete h._aaTx }
   // T3a Part 2: promote _buckets to public `buckets` field (only when present)
   if (h._buckets) { h.buckets = h._buckets; delete h._buckets }
+  // T3b: promote live fields to public fields
+  if (h._big)     { h.big = h._big;         delete h._big }
+  if (h._mb)      { h.mb  = h._mb;          delete h._mb  }
+  if (h._blk)     { h.blk = h._blk;         delete h._blk }
+  if (h._blkAddr) { h.blkAddr = h._blkAddr; delete h._blkAddr }
+  if (h._bridge)  { h.bridge  = h._bridge;  delete h._bridge  }
   compactApps(h) // v2 app stats
 }
 
