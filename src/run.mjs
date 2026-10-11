@@ -16,6 +16,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { accumulateApps, compactApps } from './apps.mjs'
+import { AUTO_TX_PER_HOUR, USER_OP_TOPIC, ENTRY_POINTS, USDC, autoStats, largestUsdcTransfer, bucketIndex, countUserOps } from './counters.mjs'
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
@@ -221,6 +222,8 @@ async function head() {
 function emptyHour() {
   // `senders` and contract `from` are plain objects during accumulation;
   // compact() converts them to counts before persisting.
+  // T3a fields: `aa` and `aaTx` are accumulated as integers; `_buckets` is a live
+  // [[count,vol],[count,vol],[count,vol]] array collapsed in compact().
   return { blocks: 0, txs: 0, failed: 0, gas: 0, fees: 0, senders: {}, contracts: {} }
 }
 
@@ -267,10 +270,15 @@ async function loadOpen() {
     failed: saved.hour.failed ?? 0,
     gas: saved.hour.gas ?? 0,
     fees: saved.hour.fees ?? 0,
+    // _senders accepts BOTH old shape (value=1) and new (value=count); both work as counters
     senders: saved.hour._senders ?? {},
     contracts: {},
     first: saved.hour.first,
-    ...(saved.hour._apps ? { apps: saved.hour._apps } : {}),
+    ...(saved.hour._apps    ? { apps: saved.hour._apps }       : {}),
+    // T3a: restore running totals (absent in old open.json files = start from 0, correct)
+    ...(saved.hour._aa      ? { _aa: saved.hour._aa }          : {}),
+    ...(saved.hour._aaTx    ? { _aaTx: saved.hour._aaTx }      : {}),
+    ...(saved.hour._buckets ? { _buckets: saved.hour._buckets } : {}),
   }
   reviveHour(h)
   // Restore contracts from _contracts (raw) if present, else they are lost (acceptable: re-accumulation starts fresh)
@@ -282,6 +290,7 @@ async function loadOpen() {
 
 // Save the open accumulator (still in live-shape, with senders as object).
 // We store a _senders snapshot and _contracts snapshot so we can resume.
+// T3a: also persist _aa, _aaTx, _buckets so those counts survive a mid-hour restart.
 async function saveOpen(hk, hour, blockCursor) {
   await writeJson(OPEN_PATH, {
     hk,
@@ -296,6 +305,10 @@ async function saveOpen(hk, hour, blockCursor) {
       _senders: hour.senders,
       _contracts: hour.contracts,
       _apps: dumpHour(hour).apps,
+      // T3a fields — only written when non-zero to keep old hours small
+      ...(hour._aa   ? { _aa: hour._aa }     : {}),
+      ...(hour._aaTx ? { _aaTx: hour._aaTx } : {}),
+      ...(hour._buckets ? { _buckets: hour._buckets } : {}),
     },
   })
 }
@@ -354,13 +367,33 @@ async function apply(blockNumbers, out, open) {
       const fee = Number(BigInt(r.gasUsed) * BigInt(r.effectiveGasPrice)) / 1e18
       h.gas += gas
       h.fees += fee
-      h.senders[r.from] = 1
+      // T3a Part 1: count per-sender transactions (replaces old presence flag h.senders[x]=1)
+      h.senders[r.from] = (h.senders[r.from] ?? 0) + 1
       const target = r.to ?? r.contractAddress
-      if (!target) continue
-      const c = (h.contracts[target] ??= { tx: 0, fee: 0, from: {} })
-      c.tx++
-      c.fee += fee
-      c.from[r.from] = 1
+      if (target) {
+        const c = (h.contracts[target] ??= { tx: 0, fee: 0, from: {} })
+        c.tx++
+        c.fee += fee
+        c.from[r.from] = 1
+      }
+      // T3a Part 1b: aaTx — bundler transactions (to == EntryPoint)
+      if (r.to && ENTRY_POINTS.has(r.to.toLowerCase())) {
+        h._aaTx = (h._aaTx ?? 0) + 1
+      }
+      // T3a Part 1c: aa — count UserOperationEvent logs from EntryPoints
+      const userOps = countUserOps(r)
+      if (userOps > 0) h._aa = (h._aa ?? 0) + userOps
+      // T3a Part 2: payment-size buckets — only for successful txs (failed have no logs)
+      if (r.status === '0x1') {
+        const usdcDec = metaCache.decimals[USDC] ?? 6  // fallback to 6 (verified Arc USDC decimals)
+        const largest = largestUsdcTransfer(r.logs ?? [], USDC, usdcDec)
+        if (largest !== null) {
+          const b = h._buckets ?? (h._buckets = [[0, 0], [0, 0], [0, 0]])
+          const idx = bucketIndex(largest)
+          b[idx][0]++
+          b[idx][1] = +(b[idx][1] + largest).toFixed(2)
+        }
+      }
     }
     // ── App stats (v2) ──
     if (HAS_APPS && receipts.length) accumulateApps(h, receipts, APPS_CONFIG, metaCache.decimals)
@@ -371,6 +404,9 @@ async function apply(blockNumbers, out, open) {
 function compact(h) {
   if (h.senders && typeof h.senders === 'object') {
     h.senderCount = Object.keys(h.senders).length
+    // T3a Part 1: derive auto stats from sender counts, then delete raw map
+    const a = autoStats(h.senders)
+    if (a.senders > 0) h.auto = a  // only written when non-zero (backwards compat)
     delete h.senders
   }
   const rows = Object.entries(h.contracts ?? {})
@@ -385,6 +421,11 @@ function compact(h) {
   h.contractCount = rows.length
   delete h.contracts
   h.fees = +h.fees.toFixed(6)
+  // T3a Part 1b/c: promote _aa/_aaTx to public fields (only when > 0; old hours lack them)
+  if (h._aa)   { h.aa   = h._aa;   delete h._aa   }
+  if (h._aaTx) { h.aaTx = h._aaTx; delete h._aaTx }
+  // T3a Part 2: promote _buckets to public `buckets` field (only when present)
+  if (h._buckets) { h.buckets = h._buckets; delete h._buckets }
   compactApps(h) // v2 app stats
 }
 

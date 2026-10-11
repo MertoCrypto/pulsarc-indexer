@@ -27,6 +27,11 @@ async function loadHours() {
 
 function windowSummary(keys, hours) {
   const total = { blocks: 0, txs: 0, failed: 0, fees: 0, walletHours: 0 }
+  // T3a accumulators
+  const autoAcc = { senders: 0, tx: 0 }
+  let aa = 0, aaTx = 0
+  let autoCoverageHours = 0, bucketsCoverageHours = 0
+  const bucketsAcc = [[0, 0], [0, 0], [0, 0]]  // [count, vol] per band
   const contracts = new Map()
   for (const k of keys) {
     const h = hours[k]
@@ -35,6 +40,22 @@ function windowSummary(keys, hours) {
     total.failed += h.failed
     total.fees += h.fees
     total.walletHours += h.senderCount ?? 0
+    // T3a Part 1
+    if (h.auto) {
+      autoAcc.senders += h.auto.senders
+      autoAcc.tx      += h.auto.tx
+      autoCoverageHours++
+    }
+    if (h.aa)   aa   += h.aa
+    if (h.aaTx) aaTx += h.aaTx
+    // T3a Part 2
+    if (h.buckets) {
+      for (let i = 0; i < 3; i++) {
+        bucketsAcc[i][0] += h.buckets[i][0]
+        bucketsAcc[i][1] = +(bucketsAcc[i][1] + h.buckets[i][1]).toFixed(2)
+      }
+      bucketsCoverageHours++
+    }
     for (const [addr, tx, wallets, fee] of h.top ?? []) {
       const c = contracts.get(addr) ?? { address: addr, txs: 0, walletHours: 0, fees: 0 }
       c.txs += tx
@@ -45,16 +66,33 @@ function windowSummary(keys, hours) {
   }
   const top = [...contracts.values()].sort((a, b) => b.txs - a.txs).slice(0, TOP)
     .map((c) => ({ ...c, fees: +c.fees.toFixed(4) }))
-  return { hours: keys.length, ...total, fees: +total.fees.toFixed(4), top }
+  const result = { hours: keys.length, ...total, fees: +total.fees.toFixed(4), top }
+  // T3a: add new fields only when non-zero to stay backwards compatible
+  if (autoAcc.senders > 0 || autoCoverageHours > 0) {
+    result.auto = autoAcc
+    result.autoCoverageHours = autoCoverageHours
+  }
+  if (aa   > 0) result.aa   = aa
+  if (aaTx > 0) result.aaTx = aaTx
+  if (bucketsCoverageHours > 0) {
+    result.buckets             = bucketsAcc
+    result.bucketsCoverageHours = bucketsCoverageHours
+  }
+  return result
 }
 
 const hours = await loadHours()
 const keys = Object.keys(hours).sort()
 const out = { network: NET, generatedAt: new Date().toISOString(), windows: {}, series: [] }
 for (const [name, n] of Object.entries(WINDOWS)) out.windows[name] = windowSummary(keys.slice(-n), hours)
-out.series = keys.slice(-168).map((k) => ({
-  hour: k, txs: hours[k].txs, failed: hours[k].failed, fees: hours[k].fees, wallets: hours[k].senderCount ?? 0, blocks: hours[k].blocks,
-}))
+out.series = keys.slice(-168).map((k) => {
+  const h = hours[k]
+  const pt = { hour: k, txs: h.txs, failed: h.failed, fees: h.fees, wallets: h.senderCount ?? 0, blocks: h.blocks }
+  // T3a: include aa/aaTx in series points when present (absent in old hours — readers treat missing as 0)
+  if (h.aa)   pt.aa   = h.aa
+  if (h.aaTx) pt.aaTx = h.aaTx
+  return pt
+})
 await writeFile(join(ROOT, 'latest.json'), JSON.stringify(out))
 console.log(`${NET}: summary over ${keys.length} hours`)
 
