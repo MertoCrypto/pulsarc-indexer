@@ -1,4 +1,5 @@
-// Runs after summarize.mjs. Writes data/<net>/anomalies.json, digest-latest.json and agents.json.
+// Runs after summarize.mjs. Writes data/<net>/anomalies.json, digest-latest.json, agents.json,
+// notified.json and feed.xml, and posts new anomalies to Telegram when a bot is configured.
 // Each step is isolated: a failure in one never blocks the others or the snapshot publish.
 
 import { readdir, readFile, writeFile } from 'node:fs/promises'
@@ -7,6 +8,7 @@ import { fileURLToPath } from 'node:url'
 import { computeAnomalies } from './anomalies.mjs'
 import { computeDigest } from './digest.mjs'
 import { scanAgents, REGISTRY } from './agents.mjs'
+import { planNotifications, renderRss, sendTelegram } from './notify.mjs'
 
 const NET = process.env.NET === 'testnet' ? 'testnet' : 'mainnet'
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', 'data', NET)
@@ -56,11 +58,34 @@ async function ethCall(calls) {
 
 const hours = await loadAllHours().catch((e) => { console.error(`${NET}: cannot read hourly data — ${e.message}`); return null })
 
+let anomalies = null
 if (hours) {
   await step('anomalies', async () => {
-    const a = computeAnomalies(hours)
+    let openHour = null
+    try { openHour = JSON.parse(await readFile(join(ROOT, 'state.json'), 'utf8')).openHour ?? null } catch { /* no state yet */ }
+    const a = computeAnomalies(hours, Date.now(), undefined, openHour)
     await writeFile(join(ROOT, 'anomalies.json'), JSON.stringify({ network: NET, ...a }))
     console.log(`${NET}: anomalies.json — ${a.status}, ${a.items.length} items`)
+    anomalies = { network: NET, ...a }
+  })
+  // The feed is always written. Telegram needs TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID and the
+  // network listed in NOTIFY_NETS (default: mainnet only).
+  await step('notify', async () => {
+    if (!anomalies) return
+    const path = join(ROOT, 'notified.json')
+    let prev = {}
+    try { prev = JSON.parse(await readFile(path, 'utf8')) } catch { /* first run */ }
+    const plan = planNotifications(anomalies, prev)
+    const token = process.env.TELEGRAM_BOT_TOKEN
+    const chat = process.env.TELEGRAM_CHAT_ID
+    const nets = (process.env.NOTIFY_NETS || 'mainnet').split(',').map((s) => s.trim())
+    let posted = 0
+    if (token && chat && nets.includes(NET)) {
+      for (const text of plan.messages) { await sendTelegram(token, chat, text); posted++ }
+    }
+    await writeFile(path, JSON.stringify(plan.state))
+    await writeFile(join(ROOT, 'feed.xml'), renderRss(plan.state.feed, NET))
+    console.log(`${NET}: notify — ${plan.messages.length} new, ${posted} posted to Telegram`)
   })
   await step('digest', async () => {
     const d = computeDigest(hours, NET)

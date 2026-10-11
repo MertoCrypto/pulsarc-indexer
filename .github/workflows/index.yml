@@ -33,9 +33,17 @@ jobs:
           node-version: 22
 
       - name: Index Arc Mainnet
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID }}
+          NOTIFY_NETS: ${{ vars.NOTIFY_NETS }}
         run: NET=mainnet BUDGET_SECONDS=1200 node src/run.mjs && NET=mainnet node src/summarize.mjs && NET=mainnet node src/label.mjs && NET=mainnet node src/extras.mjs
 
       - name: Index Arc Testnet
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID }}
+          NOTIFY_NETS: ${{ vars.NOTIFY_NETS }}
         run: NET=testnet BUDGET_SECONDS=300 BACKFILL_HOURS=24 node src/run.mjs && NET=testnet node src/summarize.mjs && NET=testnet node src/label.mjs && NET=testnet node src/extras.mjs
 
       - name: Publish snapshot

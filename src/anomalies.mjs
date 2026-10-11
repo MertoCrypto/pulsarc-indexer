@@ -23,9 +23,11 @@ function median(values) {
   return v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2
 }
 
-export function computeAnomalies(hours, now = Date.now(), cfg = CFG) {
+export function computeAnomalies(hours, now = Date.now(), cfg = CFG, openHour = null) {
   const base = { generatedAt: new Date(now).toISOString(), items: [] }
-  const keys = Object.keys(hours).sort()
+  // Only hours that have fully elapsed count: the open hour holds a fraction of its blocks
+  // and would read as a drop for every app. `openHour` (state.json) also covers an indexer that lags.
+  const keys = Object.keys(hours).sort().filter((k) => k !== openHour && hourStart(k) + HOUR_MS <= now)
   const lastKey = keys[keys.length - 1]
   if (!lastKey) return { ...base, status: 'warming-up', hour: null }
 

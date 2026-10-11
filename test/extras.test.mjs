@@ -141,3 +141,65 @@ describe('agents scanner', () => {
     assert.deepEqual(r.agents.map((a) => a.uri), [undefined, undefined])
   })
 })
+
+import { planNotifications, renderRss, describe as describeItem, sendTelegram } from '../src/notify.mjs'
+
+describe('anomalies ignore the unfinished hour', () => {
+  it('does not read a partial hour as a drop', () => {
+    // 30 full hours, then the open hour (12:00, a third done) with a third of the txs
+    const h = series(30, flat(() => ({ usdc: { tx: 1000 } })))
+    h['2026-10-10T12'] = { txs: 300, apps: { usdc: { tx: 300 } } }
+    const r = computeAnomalies(h, NOW)
+    assert.equal(r.hour, '2026-10-10T11')
+    assert.equal(r.items.length, 0)
+  })
+  it('skips the hour the indexer still has open, even when the clock says it ended', () => {
+    const h = series(30, flat((back) => ({ usdc: { tx: back === 0 ? 100 : 1000 } })))
+    const r = computeAnomalies(h, NOW, undefined, '2026-10-10T11')
+    assert.equal(r.hour, '2026-10-10T10')
+    assert.equal(r.items.length, 0)
+  })
+})
+
+describe('notify', () => {
+  const anomalies = { network: 'mainnet', status: 'ok', hour: '2026-10-10T11', items: [
+    { app: 'usdc', kind: 'spike', ratio: 3.1, txs: 12400, baseline: 4000 },
+    { app: 'eurc', kind: 'drop', ratio: 0.2, txs: 90, baseline: 450 },
+  ] }
+  it('builds one message per new item and remembers it', () => {
+    const p = planNotifications(anomalies, {})
+    assert.equal(p.messages.length, 2)
+    assert.match(p.messages[0], /^usdc on Arc: 3\.1x its usual activity\. 12,400 transactions/)
+    assert.match(p.messages[1], /down 80%/)
+    assert.match(p.messages[0], /https:\/\/pulsarc\.vercel\.app\/dapp\/usdc$/)
+    assert.deepEqual(p.state.sent, ['2026-10-10T11:usdc:spike', '2026-10-10T11:eurc:drop'])
+    assert.equal(p.state.feed.length, 2)
+  })
+  it('sends nothing the second time for the same hour', () => {
+    const first = planNotifications(anomalies, {})
+    const again = planNotifications(anomalies, first.state)
+    assert.equal(again.messages.length, 0)
+    assert.deepEqual(again.state, first.state)
+  })
+  it('caps messages per run and ignores non-ok or malformed input', () => {
+    const many = { ...anomalies, items: ['a', 'b', 'c', 'd', 'e'].map((app) => ({ app, kind: 'spike', ratio: 2, txs: 500, baseline: 250 })) }
+    assert.equal(planNotifications(many, {}).messages.length, 3)
+    assert.equal(planNotifications({ ...anomalies, status: 'stale' }, {}).messages.length, 0)
+    assert.equal(planNotifications(null, {}).messages.length, 0)
+    const hostile = { ...anomalies, items: [{ app: '<b>x</b> http://evil', kind: 'spike', ratio: 2, txs: 500, baseline: 250 }] }
+    assert.equal(planNotifications(hostile, {}).messages.length, 0)
+  })
+  it('labels testnet and renders escaped RSS', () => {
+    assert.match(describeItem(anomalies.items[0], 'testnet'), /on Arc Testnet/)
+    const xml = renderRss([{ id: 'a&b', title: 'x < y', link: 'https://pulsarc.vercel.app/dapp/usdc', date: '2026-10-10T12:00:00.000Z' }], 'mainnet')
+    assert.match(xml, /<title>x &lt; y<\/title>/)
+    assert.match(xml, /<guid isPermaLink="false">a&amp;b<\/guid>/)
+  })
+  it('posts plain text to the Telegram API and throws on failure', async () => {
+    const calls = []
+    await sendTelegram('T', '@chan', 'hello', async (url, init) => { calls.push([url, JSON.parse(init.body)]); return { ok: true } })
+    assert.equal(calls[0][0], 'https://api.telegram.org/botT/sendMessage')
+    assert.deepEqual(calls[0][1], { chat_id: '@chan', text: 'hello', disable_web_page_preview: true })
+    await assert.rejects(sendTelegram('T', '@chan', 'x', async () => ({ ok: false, status: 403 })), /Telegram HTTP 403/)
+  })
+})
