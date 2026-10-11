@@ -39,6 +39,8 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID }}
           NOTIFY_NETS: mainnet
           NOTIFY_KINDS: anomaly
+          # Wallet index on mainnet stays off until the repository variable WALLET_INDEX_MAINNET is set to 1.
+          WALLET_INDEX: ${{ vars.WALLET_INDEX_MAINNET }}
         run: NET=mainnet BUDGET_SECONDS=1200 node src/run.mjs && NET=mainnet node src/summarize.mjs && NET=mainnet node src/supply.mjs && NET=mainnet node src/label.mjs && NET=mainnet node src/extras.mjs
 
       - name: Index Arc Testnet
