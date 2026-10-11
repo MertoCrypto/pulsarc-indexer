@@ -12,10 +12,19 @@
 //     BACKFILL_HOURS   how far back to start on first run (default 24)
 //     BUDGET_SECONDS   wall-clock budget (default 1200)
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile, rename } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { accumulateApps, compactApps } from './apps.mjs'
+import {
+  dayOf  as walletDayOf,
+  buildAppIndex,
+  walletDeltas,
+  mergeInto,
+  encodeShard,
+  encodeRecord,
+  decodeRecord,
+} from './wallets.mjs'
 import {
   AUTO_TX_PER_HOUR, USER_OP_TOPIC, ENTRY_POINTS, USDC, autoStats,
   largestUsdcTransfer, bucketIndex, countUserOps,
@@ -68,6 +77,26 @@ const PAUSE_MS = 80
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', 'data', NET)
 const INDEXER_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
+
+// ── Wallet index feature flag ────────────────────────────────────────────────
+// Set WALLET_INDEX=1 to enable per-wallet accumulation. Default OFF so existing
+// behaviour and tests are completely unchanged.
+const WALLET_INDEX = process.env.WALLET_INDEX === '1'
+
+/**
+ * Maximum distinct wallets per day in the pending file. Beyond this, NEW wallets
+ * are not added (dropped counter incremented); existing wallets are still updated.
+ * At 400,000 wallets × ~90 bytes ≈ 36 MB pending file (acceptable for git).
+ */
+const WALLET_CAP = 400_000
+
+const PENDING_PATH = join(ROOT, 'wallets-pending.json')
+
+/** wallet index state: Map<day (int), Map<lc-addr, record>> */
+let walletDays = new Map()
+let walletDropped = 0
+let walletCappedWarned = false
+let walletAppIndex = new Map()  // built once in main()
 
 // Build the endpoint rotation list from env or defaults
 function buildEndpoints() {
@@ -341,6 +370,98 @@ async function deleteOpen() {
   try { await writeJson(OPEN_PATH, null) } catch { /* ignore */ }
 }
 
+// ── Wallet-index helpers (active only when WALLET_INDEX=1) ───────────────────
+
+/**
+ * Load wallets-pending.json into walletDays / walletDropped.
+ * On corrupt or missing file: start empty and log one warning.
+ */
+async function loadWalletPending() {
+  let raw
+  try {
+    raw = JSON.parse(await readFile(PENDING_PATH, 'utf8'))
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.warn('[wallets] pending file unreadable; starting empty')
+    return
+  }
+  if (!raw || raw.version !== 1 || typeof raw.days !== 'object') {
+    console.warn('[wallets] pending file corrupt; starting empty')
+    return
+  }
+  walletDropped = raw.dropped ?? 0
+  for (const [dayStr, shardObj] of Object.entries(raw.days)) {
+    const day = Number(dayStr)
+    const map = new Map()
+    for (const [addr, encoded] of Object.entries(shardObj)) {
+      map.set(addr.toLowerCase(), decodeRecord(encoded))
+    }
+    walletDays.set(day, map)
+  }
+}
+
+/**
+ * Persist wallets-pending.json atomically (temp file + rename).
+ *
+ * TRADE-OFF: we write this BEFORE state.json. That means if we crash between
+ * the two writes, state.json still points to the old cursor, so the next run
+ * will re-process some blocks and call walletDeltas on them again. Because
+ * mergeInto is idempotent for the same (day, addr, delta) only when the block
+ * produces the same delta — which it will, since the RPC is deterministic —
+ * this leads to at most one batch being double-counted for wallets, but never
+ * lost.  The alternative (writing state.json first) would silently drop wallet
+ * data on a crash, which is harder to detect.
+ */
+async function saveWalletPending() {
+  const days = {}
+  for (const [day, map] of walletDays) {
+    const obj = {}
+    for (const [addr, rec] of map) obj[addr] = encodeRecord(rec)
+    days[String(day)] = obj
+  }
+  const tmp = PENDING_PATH + '.tmp'
+  await mkdir(dirname(PENDING_PATH), { recursive: true })
+  await writeFile(tmp, JSON.stringify({ version: 1, dropped: walletDropped, days }))
+  await rename(tmp, PENDING_PATH)
+}
+
+/**
+ * Accumulate one block's wallet deltas into walletDays.
+ *
+ * @param {object[]} receipts   eth_getBlockReceipts result
+ * @param {number}   blockTs    block.timestamp as a number (seconds)
+ * @param {number}   usdcDec    USDC decimals
+ */
+function accumulateWalletBlock(receipts, blockTs, usdcDec) {
+  const day = walletDayOf(blockTs)
+  if (!walletDays.has(day)) walletDays.set(day, new Map())
+  const dayMap = walletDays.get(day)
+
+  const deltas = walletDeltas(receipts, {
+    day,
+    usdcDecimals: usdcDec,
+    appIndex: walletAppIndex,
+    net: NET,
+  })
+
+  for (const [addr, delta] of deltas) {
+    if (dayMap.has(addr)) {
+      // existing wallet — always update
+      mergeInto(dayMap, addr, delta)
+    } else {
+      // new wallet — check cap
+      if (dayMap.size >= WALLET_CAP) {
+        walletDropped++
+        if (!walletCappedWarned) {
+          console.warn(`[wallets] wallet cap ${WALLET_CAP} reached for day ${day}; new wallets dropped`)
+          walletCappedWarned = true
+        }
+        continue
+      }
+      mergeInto(dayMap, addr, delta)
+    }
+  }
+}
+
 // ── Block processing ─────────────────────────────────────────────────────────
 
 async function fetchBatch(blockNumbers) {
@@ -491,6 +612,12 @@ async function apply(blockNumbers, out, open) {
     }
     // ── App stats (v2) ──
     if (HAS_APPS && receipts.length) accumulateApps(h, receipts, APPS_CONFIG, metaCache.decimals)
+
+    // ── Wallet index (feature-flagged) ──
+    if (WALLET_INDEX && receipts.length) {
+      const usdcDec = metaCache.decimals[USDC] ?? 6
+      accumulateWalletBlock(receipts, num(block.timestamp), usdcDec)
+    }
   }
 }
 
@@ -540,6 +667,13 @@ async function flush() {
 
 async function main() {
   const t0 = Date.now()
+
+  // Build wallet app index once (empty when no apps config)
+  if (WALLET_INDEX) {
+    walletAppIndex = buildAppIndex(APPS_CONFIG)
+    await loadWalletPending()
+  }
+
   await fetchDecimals()
   const tip = await head()
   const statePath = join(ROOT, 'state.json')
@@ -605,6 +739,8 @@ async function main() {
     if (open.hk !== null) {
       await saveOpen(open.hk, open.hour, next)
     }
+    // Save wallet pending alongside open.json (same crash semantics)
+    if (WALLET_INDEX) await saveWalletPending()
 
     await new Promise((r) => setTimeout(r, PAUSE_MS))
   }
@@ -626,6 +762,13 @@ async function main() {
   await flush()
 
   if (HAS_APPS) await writeJson(META_PATH, metaCache)
+
+  // Persist wallet index BEFORE state.json (see trade-off comment in saveWalletPending).
+  // If we crash between these two writes, state.json still points to the old cursor,
+  // so the next run will re-process the last batch; at most a few blocks are double-
+  // counted for wallets, but no wallet data is ever silently lost.
+  if (WALLET_INDEX) await saveWalletPending()
+
   // Persist state
   await writeJson(statePath, {
     next,

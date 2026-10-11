@@ -37,6 +37,7 @@ function sandbox(state) {
   cpSync(join(SRC, 'run.mjs'),      join(d, 'src', 'run.mjs'))
   cpSync(join(SRC, 'apps.mjs'),     join(d, 'src', 'apps.mjs'))
   cpSync(join(SRC, 'counters.mjs'), join(d, 'src', 'counters.mjs'))
+  cpSync(join(SRC, 'wallets.mjs'),  join(d, 'src', 'wallets.mjs'))
   writeFileSync(join(d, 'apps.testnet.json'), JSON.stringify({ apps: [{ id: 'tok', anchors: [{ address: '0xdd', kind: 'token', usd: true }] }, { id: 'ctr', anchors: [{ address: '0xc0', kind: 'contract' }] }] }))
   if (state) { mkdirSync(join(d, 'data', 'testnet'), { recursive: true }); writeFileSync(join(d, 'data', 'testnet', 'state.json'), JSON.stringify(state)) }
   return d
@@ -88,6 +89,40 @@ server.listen(0, '127.0.0.1', async () => {
   await run(F, env)
   const fb = Object.values(JSON.parse(Object.values(days(F))[0])).reduce((s, h) => s + h.blocks, 0)
   check('migration restarts open hour', state(F).next === TIP + 1 && fb === TIP + 1 - 90, `(blocks=${fb})`)
+
+  // 6. WALLET_INDEX=1: single run vs many tiny slices produce identical wallets-pending.json
+  {
+    const walletEnv = { ...env, WALLET_INDEX: '1' }
+    const pendingPath = (d) => join(d, 'data', 'testnet', 'wallets-pending.json')
+    const readPending = (d) => { try { return JSON.parse(readFileSync(pendingPath(d), 'utf8')) } catch { return null } }
+
+    const W1 = sandbox(seed); await run(W1, walletEnv)
+    const W2 = sandbox(seed); let nw = 0
+    while (state(W2).next <= TIP && nw++ < 500) await run(W2, { ...walletEnv, BUDGET_SECONDS: '0.12' })
+
+    const p1 = readPending(W1)
+    const p2 = readPending(W2)
+    check('WALLET_INDEX=1: pending file exists after single run', p1 !== null)
+    check('WALLET_INDEX=1: pending file exists after sliced run', p2 !== null)
+    check('WALLET_INDEX=1: version=1', p1?.version === 1 && p2?.version === 1)
+
+    // Compare t+x totals from both pending files — they must match
+    // (t and x are the fields accumulated from transaction receipts).
+    function totalTx(pending) {
+      let t = 0, x = 0
+      for (const dayObj of Object.values(pending?.days ?? {})) {
+        for (const encoded of Object.values(dayObj)) {
+          // encoded = [f,l,d,t,x,e,o,i,a,bo,bi]
+          if (Array.isArray(encoded)) { t += encoded[3] ?? 0; x += encoded[4] ?? 0 }
+        }
+      }
+      return { t, x }
+    }
+    const tot1 = totalTx(p1), tot2 = totalTx(p2)
+    check('WALLET_INDEX=1: same total t across single/sliced', tot1.t === tot2.t, `(${tot1.t} vs ${tot2.t})`)
+    check('WALLET_INDEX=1: same total x across single/sliced', tot1.x === tot2.x, `(${tot1.x} vs ${tot2.x})`)
+    check('WALLET_INDEX=1: tx count matches hourly total', tot1.t === (TIP + 1) * 2, `(t=${tot1.t} expected ${(TIP + 1) * 2})`)
+  }
 
   server.close(); console.log(bad ? `${bad} FAILED` : 'all passed'); process.exit(bad ? 1 : 0)
 })
