@@ -61,5 +61,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          sleep 120
+          sleep 420
           gh workflow run index.yml --ref "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}"
