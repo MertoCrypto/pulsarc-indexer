@@ -23,9 +23,25 @@ const server = http.createServer((req, res) => {
       const n = parseInt(c.params?.[0] ?? '0', 16)
       if (c.method === 'eth_call') return { id: c.id, result: '0x' + (6).toString(16).padStart(64, '0') }
       if (c.method === 'eth_blockNumber') return { id: c.id, result: '0x' + TIP.toString(16) }
-      if (c.method === 'eth_getBlockByNumber') return { id: c.id, result: { timestamp: '0x' + (BASE_TS + n * STEP).toString(16) } }
+      if (c.method === 'eth_getBlockByNumber') return { id: c.id, result: { timestamp: '0x' + (BASE_TS + n * STEP).toString(16), transactions: ['0xh1', '0xh2'] } }
       const mk = (k) => ({ status: k % 7 ? '0x1' : '0x0', gasUsed: '0x5208', effectiveGasPrice: '0x4a817c800', from: '0xa' + (n % 5), to: '0xc' + ((n + k) % 3), logs: [{ address: '0xdd', topics: ['0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef', '0x' + '0'.repeat(63) + (n % 4), '0x' + '0'.repeat(63) + '9'], data: '0x' + (1000000).toString(16).padStart(64, '0') }] })
       return { id: c.id, result: [mk(0), mk(1)] }
+    })
+    res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(out))
+  })
+})
+
+// Behaves like Blockdaemon on old blocks: answers every receipts request with [] and no error.
+const pruned = http.createServer((req, res) => {
+  let body = ''
+  req.on('data', (c) => (body += c))
+  req.on('end', () => {
+    const out = JSON.parse(body).map((c) => {
+      const n = parseInt(c.params?.[0] ?? '0', 16)
+      if (c.method === 'eth_call') return { id: c.id, result: '0x' + (6).toString(16).padStart(64, '0') }
+      if (c.method === 'eth_blockNumber') return { id: c.id, result: '0x' + TIP.toString(16) }
+      if (c.method === 'eth_getBlockByNumber') return { id: c.id, result: { timestamp: '0x' + (BASE_TS + n * STEP).toString(16), transactions: ['0xh1', '0xh2'] } }
+      return { id: c.id, result: [] }
     })
     res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(out))
   })
@@ -51,6 +67,7 @@ const state = (d) => JSON.parse(readFileSync(join(d, 'data', 'testnet', 'state.j
 let bad = 0
 const check = (name, ok, extra = '') => { console.log(`${ok ? 'PASS' : 'FAIL'}  ${name} ${extra}`); if (!ok) bad++ }
 
+pruned.listen(0, '127.0.0.1')
 server.listen(0, '127.0.0.1', async () => {
   const seed = { next: 0, tip: 0 } // start at block 0, no backfill jump (BACKFILL_HOURS huge)
   const env = { BACKFILL_HOURS: '100000', BUDGET_SECONDS: '60' }
@@ -124,5 +141,19 @@ server.listen(0, '127.0.0.1', async () => {
     check('WALLET_INDEX=1: tx count matches hourly total', tot1.t === (TIP + 1) * 2, `(t=${tot1.t} expected ${(TIP + 1) * 2})`)
   }
 
+  // 7. a pruned endpoint answering with empty receipts must be rejected, not indexed as "0 transactions"
+  {
+    const prunedUrl = `http://127.0.0.1:${pruned.address().port}`
+    const goodUrl = `http://127.0.0.1:${server.address().port}`
+    const P = sandbox(seed); const rp = await run(P, { ...env, RPC_URLS: `${prunedUrl},${goodUrl}` })
+    const hrs7 = Object.values(days(P)).flatMap((t) => Object.values(JSON.parse(t)))
+    check('pruned endpoint first: run still succeeds', rp.status === 0)
+    check('pruned endpoint first: every transaction is counted from the good endpoint', hrs7.reduce((t, h) => t + h.txs, 0) === (TIP + 1) * 2, `(txs=${hrs7.reduce((t, h) => t + h.txs, 0)})`)
+    check('pruned endpoint first: the mismatch is logged', /receipts != transactions/.test(rp.stderr + rp.stdout))
+    const Q = sandbox(seed); const rq = await run(Q, { ...env, RPC_URLS: prunedUrl })
+    check('only a pruned endpoint: the run stops early and the cursor does not move', /stopped early/.test(rq.stderr + rq.stdout) && state(Q).next === 0)
+  }
+
+  pruned.close()
   server.close(); console.log(bad ? `${bad} FAILED` : 'all passed'); process.exit(bad ? 1 : 0)
 })

@@ -390,3 +390,27 @@ export function countUserOps(receipt) {
   }
   return count
 }
+
+
+// ── Receipt sanity check (Blockdaemon returns EMPTY receipts for pruned blocks without any error) ──
+
+/**
+ * Indexes (into a fetchBatch result: [block0, receipts0, block1, receipts1, ...]) whose receipts do not
+ * match the block's transaction list. A correct node returns exactly one receipt per transaction; an
+ * endpoint that has pruned a block answers [] (or null) with no error, which would silently be indexed
+ * as "0 transactions". Blocks without a `transactions` array are not checked.
+ * @param {number} count  number of blocks in the batch
+ * @param {any[]}  out    interleaved block/receipts results
+ * @returns {number[]}
+ */
+export function badReceiptIndexes(count, out) {
+  const bad = []
+  for (let i = 0; i < count; i++) {
+    const block = out[i * 2]
+    const receipts = out[i * 2 + 1]
+    if (!block || !Array.isArray(block.transactions)) continue
+    const have = Array.isArray(receipts) ? receipts.length : 0
+    if (have !== block.transactions.length) bad.push(i)
+  }
+  return bad
+}

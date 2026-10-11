@@ -33,6 +33,7 @@ import {
   DEPOSIT_FOR_BURN_TOPIC, MESSAGE_RECEIVED_TOPIC,
   bigTransfers, mintBurnFromLogs, blocklistFromLogs,
   decodeDepositForBurn, decodeMessageReceived,
+  badReceiptIndexes,
 } from './counters.mjs'
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -464,13 +465,23 @@ function accumulateWalletBlock(receipts, blockTs, usdcDec) {
 
 // ── Block processing ─────────────────────────────────────────────────────────
 
-async function fetchBatch(blockNumbers) {
+async function fetchBatch(blockNumbers, attempt = 0) {
   const calls = []
   blockNumbers.forEach((n, i) => {
     calls.push({ jsonrpc: '2.0', id: i * 2,     method: 'eth_getBlockByNumber', params: [hex(n), false] })
     calls.push({ jsonrpc: '2.0', id: i * 2 + 1, method: 'eth_getBlockReceipts', params: [hex(n)] })
   })
-  return rpc(calls)
+  const out = await rpc(calls)
+  // A pruned endpoint (Blockdaemon) answers old blocks with EMPTY receipts and no error. The block lists its
+  // transactions, so a receipt count that differs from it means the answer is wrong: ask another endpoint
+  // rather than index "0 transactions". If every endpoint disagrees, fail the run (state stays untouched).
+  const bad = badReceiptIndexes(blockNumbers.length, out)
+  if (bad.length === 0) return out
+  if (attempt >= ENDPOINTS.length) {
+    throw new Error(`receipts do not match the block's transactions for block ${blockNumbers[bad[0]]} on every endpoint`)
+  }
+  rotateEndpoint(`receipts != transactions for block ${blockNumbers[bad[0]]}`)
+  return fetchBatch(blockNumbers, attempt + 1)
 }
 
 /**
