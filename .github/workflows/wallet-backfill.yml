@@ -1,0 +1,40 @@
+name: wallet-backfill
+
+# One-off (rerunnable) history backfill of the wallet index. Run it by hand AFTER the mainnet wallet index has
+# started (repository variable WALLET_INDEX_MAINNET=1) and BEFORE enabling the daily publish
+# (WALLET_PUBLISH_MAINNET). It resumes where it stopped when the 5.5 h budget runs out.
+on:
+  workflow_dispatch:
+    inputs:
+      net:
+        description: 'mainnet or testnet'
+        default: 'mainnet'
+      from_block:
+        description: 'first block to scan (0 = from genesis)'
+        default: '0'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wallet-backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Read the live wallet index start from the data branch
+        run: |
+          git clone --quiet --depth 1 --branch data "https://github.com/${GITHUB_REPOSITORY}.git" data
+          rm -rf data/.git
+      - name: Backfill
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FROM_BLOCK: ${{ inputs.from_block }}
+        run: ./scripts/backfill-wallets.sh "${{ inputs.net }}"

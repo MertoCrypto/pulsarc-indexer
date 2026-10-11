@@ -59,6 +59,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./scripts/publish-wallets.sh testnet
 
+      # Mainnet: only after the history backfill has finished (workflow wallet-backfill) and the variable is set.
+      - name: Publish wallet index (mainnet)
+        if: ${{ vars.WALLET_PUBLISH_MAINNET == '1' }}
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./scripts/publish-wallets.sh mainnet
+
       - name: Publish snapshot
         run: ./scripts/publish.sh
         env:

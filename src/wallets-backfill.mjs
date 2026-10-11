@@ -24,7 +24,7 @@
 //
 // CLI:
 //   NET=mainnet RPC_URLS=... node src/wallets-backfill.mjs \
-//     --out <dir> --from-block N --until-block M [--span 5000] [--live-pending <file>]
+//     --out <dir> --from-block N --until-block M [--span 5000] [--live-pending <file>] [--no-partial]
 //   Where M is the first block the live indexer covers.
 //   Runs runBackfill for all complete days before M's day, then runPartialDay
 //   for the part of M's day before M.  Prints one summary line per day and
@@ -736,13 +736,17 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     // 2. Run partial day for the part of untilDay's blocks before untilBlock
     // (the live indexer covers untilBlock onward; we handle [dayStart .. untilBlock-1]).
     // --live-pending lets the cut-over merge straight into the live indexer's pending file.
-    const pendingPath = argVal('--live-pending') || join(pendingDir, 'wallets-pending.json')
-    const dayStarts = await readJson(join(outDir, 'backfill-days.json'), {})
-    const range = partialDayRange(dayStarts, untilDay, untilBlock)
-    const result = range
-      ? await runPartialDay({ rpc, pendingPath, day: untilDay, fromBlock: range[0], toBlock: range[1], span })
-      : { wallets: 0, logs: 0 }
-    console.log(`backfill: partial day=${untilDay} wallets=${result.wallets} logs=${result.logs}`)
+    if (args.includes('--no-partial')) {
+      console.log('backfill: --no-partial, cut-over day not scanned')
+    } else {
+      const pendingPath = argVal('--live-pending') || join(pendingDir, 'wallets-pending.json')
+      const dayStarts = await readJson(join(outDir, 'backfill-days.json'), {})
+      const range = partialDayRange(dayStarts, untilDay, untilBlock)
+      const result = range
+        ? await runPartialDay({ rpc, pendingPath, day: untilDay, fromBlock: range[0], toBlock: range[1], span })
+        : { wallets: 0, logs: 0 }
+      console.log(`backfill: partial day=${untilDay} wallets=${result.wallets} logs=${result.logs}`)
+    }
   } catch (e) {
     console.error(`backfill error: ${e.message}`)
     process.exit(1)

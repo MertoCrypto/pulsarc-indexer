@@ -19,7 +19,7 @@ if [ "${CLOSED}" -eq 0 ]; then echo "wallets: no closed day to publish for ${NET
 REMOTE="${WALLETS_REMOTE:-https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git}"
 rm -rf wallets-out
 if git ls-remote --exit-code --heads "$REMOTE" "$BRANCH" >/dev/null 2>&1; then
-  git clone --quiet --depth 1 --branch "$BRANCH" "$REMOTE" wallets-out
+  git -c gc.auto=0 -c maintenance.auto=false clone --quiet --depth 1 --branch "$BRANCH" "$REMOTE" wallets-out
   rm -rf wallets-out/.git
 else
   mkdir -p wallets-out
@@ -32,6 +32,7 @@ cd wallets-out
 git init -q -b "$BRANCH"
 git config user.name "pulsarc-indexer"
 git config user.email "indexer@users.noreply.github.com"
+git config gc.auto 0; git config maintenance.auto false   # no detached background gc after the push
 git add -A
 git commit -q -m "wallet index ${NET} through day $(jq -r .through meta.json) ($(date -u +%Y-%m-%dT%H:%MZ))"
 git remote add origin "$REMOTE"
