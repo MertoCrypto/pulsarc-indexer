@@ -238,6 +238,189 @@ export async function checkWalletMeta(
 }
 
 /**
+ * Check the content / semantic integrity of a known indexer JSON file.
+ *
+ * @param {string}  file  Filename (basename only, e.g. 'latest.json').
+ * @param {unknown} body  Already-parsed JSON value (may be anything).
+ * @returns {Array<{ status: Status, label: string, detail: string }>}
+ *
+ * Rules per file:
+ *   latest.json      – windows['24h'] present & txs finite & > 0; series >= 24 entries
+ *   apps-latest.json – coverageHours >= 24; apps has at least one key
+ *   state.json       – chainId === 5042; tip-next <= 500; skipped is empty array
+ *   supply.json      – tokens.usdc.supply is finite & > 0
+ *   balances.json    – total is finite & >= 0; apps has at least one key
+ *   agents.json      – count is finite & > 0; caughtUp is true
+ *   any other file   – returns []
+ */
+export function checkContent(file, body) {
+  const label = `${file} content`;
+
+  // Shared guard: body must be a plain object (not null, not array, not scalar).
+  function guardObject() {
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+      return result('WARN', label, `body is not an object (got ${body === null ? 'null' : Array.isArray(body) ? 'array' : typeof body})`);
+    }
+    return null;
+  }
+
+  // ---- latest.json --------------------------------------------------------
+  if (file === 'latest.json') {
+    const guard = guardObject();
+    if (guard) return [guard];
+
+    const windows = body.windows;
+    if (windows === undefined || windows === null || typeof windows !== 'object' || Array.isArray(windows)) {
+      return [result('WARN', label, 'windows field is missing or not an object')];
+    }
+
+    const w24 = windows['24h'];
+    if (w24 === undefined || w24 === null || typeof w24 !== 'object' || Array.isArray(w24)) {
+      return [result('FAIL', label, "windows['24h'] is missing")];
+    }
+
+    const txs = w24.txs;
+    if (!Number.isFinite(txs)) {
+      return [result('FAIL', label, `windows['24h'].txs is not a finite number (got ${JSON.stringify(txs)})`)];
+    }
+
+    if (txs === 0) {
+      return [result('FAIL', label, "windows['24h'].txs is 0")];
+    }
+
+    const checks = [];
+
+    const hours = w24.hours;
+    if (Number.isFinite(hours) && hours < 24) {
+      checks.push(result('WARN', label, `windows['24h'].hours is ${hours} (< 24; indexer has not covered a full day)`));
+    }
+
+    const series = body.series;
+    if (!Array.isArray(series) || series.length < 24) {
+      checks.push(result('WARN', label, `series has ${Array.isArray(series) ? series.length : 'no'} entries (< 24)`));
+    }
+
+    if (checks.length > 0) return checks;
+
+    return [result('PASS', label, `24h txs=${txs}, hours=${hours}`)];
+  }
+
+  // ---- apps-latest.json ---------------------------------------------------
+  if (file === 'apps-latest.json') {
+    const guard = guardObject();
+    if (guard) return [guard];
+
+    const checks = [];
+
+    const coverageHours = body.coverageHours;
+    if (!Number.isFinite(coverageHours) || coverageHours < 24) {
+      checks.push(result('WARN', label, `coverageHours is ${JSON.stringify(coverageHours)} (< 24)`));
+    }
+
+    const apps = body.apps;
+    if (apps === null || typeof apps !== 'object' || Array.isArray(apps) || Object.keys(apps).length === 0) {
+      checks.push(result('FAIL', label, 'apps has no keys'));
+    }
+
+    if (checks.length > 0) return checks;
+
+    return [result('PASS', label, `${Object.keys(apps).length} apps`)];
+  }
+
+  // ---- state.json ---------------------------------------------------------
+  if (file === 'state.json') {
+    const guard = guardObject();
+    if (guard) return [guard];
+
+    const checks = [];
+
+    const chainId = body.chainId;
+    if (chainId !== 5042) {
+      checks.push(result('FAIL', label, `chainId is ${JSON.stringify(chainId)}, expected 5042`));
+    }
+
+    const next = body.next;
+    const tip = body.tip;
+    if (Number.isFinite(next) && Number.isFinite(tip) && tip - next > 500) {
+      checks.push(result('WARN', label, `tip - next = ${tip - next} blocks (> 500)`));
+    }
+
+    const skipped = body.skipped;
+    if (Array.isArray(skipped) && skipped.length > 0) {
+      let total = 0;
+      for (const range of skipped) {
+        if (Array.isArray(range) && range.length >= 2 && Number.isFinite(range[0]) && Number.isFinite(range[1])) {
+          total += range[1] - range[0] + 1;
+        }
+      }
+      checks.push(result('WARN', label, `skipped has ${skipped.length} range(s), ${total} total blocks skipped`));
+    }
+
+    if (checks.length > 0) return checks;
+
+    return [result('PASS', label, `chainId=5042, tip-next=${Number.isFinite(tip) && Number.isFinite(next) ? tip - next : 'unknown'}`)];
+  }
+
+  // ---- supply.json --------------------------------------------------------
+  if (file === 'supply.json') {
+    const guard = guardObject();
+    if (guard) return [guard];
+
+    const supply = body?.tokens?.usdc?.supply;
+    if (!Number.isFinite(supply) || supply <= 0) {
+      return [result('FAIL', label, `tokens.usdc.supply is not a finite number > 0 (got ${JSON.stringify(supply)})`)];
+    }
+    return [result('PASS', label, `usdc supply=${supply}`)];
+  }
+
+  // ---- balances.json ------------------------------------------------------
+  if (file === 'balances.json') {
+    const guard = guardObject();
+    if (guard) return [guard];
+
+    const checks = [];
+
+    const total = body.total;
+    if (!Number.isFinite(total) || total < 0) {
+      checks.push(result('FAIL', label, `total is not a finite number >= 0 (got ${JSON.stringify(total)})`));
+    }
+
+    const apps = body.apps;
+    if (apps === null || typeof apps !== 'object' || Array.isArray(apps) || Object.keys(apps).length === 0) {
+      checks.push(result('FAIL', label, 'apps has no keys'));
+    }
+
+    if (checks.length > 0) return checks;
+
+    return [result('PASS', label, `total=${total}, ${Object.keys(apps).length} apps`)];
+  }
+
+  // ---- agents.json --------------------------------------------------------
+  if (file === 'agents.json') {
+    const guard = guardObject();
+    if (guard) return [guard];
+
+    const checks = [];
+
+    const count = body.count;
+    if (!Number.isFinite(count) || count <= 0) {
+      checks.push(result('FAIL', label, `count is not a finite number > 0 (got ${JSON.stringify(count)})`));
+    }
+
+    if (body.caughtUp !== true) {
+      checks.push(result('WARN', label, `caughtUp is ${JSON.stringify(body.caughtUp)}, expected true`));
+    }
+
+    if (checks.length > 0) return checks;
+
+    return [result('PASS', label, `count=${count}, caughtUp=true`)];
+  }
+
+  // ---- any other file -----------------------------------------------------
+  return [];
+}
+
+/**
  * Derive the final verdict from an array of check results.
  *
  * @param {Array<{ status: Status }>} checks
@@ -292,6 +475,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       const freshResult = checkFreshness(fileResult.body, filename, tight);
       printResult(freshResult);
       allResults.push(freshResult);
+
+      const contentResults = checkContent(filename, fileResult.body);
+      for (const cr of contentResults) {
+        printResult(cr);
+        allResults.push(cr);
+      }
     }
   }
 

@@ -10,7 +10,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 // Resolve the module under test relative to this file.
-import { checkFile, checkFreshness, checkWalletMeta, summarize } from '../src/mainnet-ready.mjs';
+import { checkFile, checkFreshness, checkWalletMeta, checkContent, summarize } from '../src/mainnet-ready.mjs';
 
 // ---------------------------------------------------------------------------
 // Fake fetch factory helpers
@@ -331,3 +331,341 @@ describe('summarize', () => {
     assert.equal(exitCode, 0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// checkContent
+// ---------------------------------------------------------------------------
+
+describe('checkContent – unknown file', () => {
+  it('returns [] for an unrecognised filename', () => {
+    const r = checkContent('unknown.json', { anything: true });
+    assert.deepEqual(r, []);
+  });
+});
+
+// ---- latest.json -----------------------------------------------------------
+
+describe('checkContent – latest.json', () => {
+  it('WARN on null body', () => {
+    const [r] = checkContent('latest.json', null);
+    assert.equal(r.status, 'WARN');
+    assert.match(r.detail, /not an object/i);
+  });
+
+  it('WARN on array body', () => {
+    const [r] = checkContent('latest.json', []);
+    assert.equal(r.status, 'WARN');
+    assert.match(r.detail, /not an object/i);
+  });
+
+  it('WARN on string body', () => {
+    const [r] = checkContent('latest.json', 'hello');
+    assert.equal(r.status, 'WARN');
+    assert.match(r.detail, /not an object/i);
+  });
+
+  it('WARN when windows field is missing', () => {
+    const [r] = checkContent('latest.json', { network: 'mainnet' });
+    assert.equal(r.status, 'WARN');
+    assert.match(r.detail, /windows/i);
+  });
+
+  it("FAIL when windows['24h'] is missing", () => {
+    const [r] = checkContent('latest.json', { windows: { '1h': { hours: 1, txs: 10 } } });
+    assert.equal(r.status, 'FAIL');
+    assert.match(r.detail, /windows\['24h'\] is missing/);
+  });
+
+  it("FAIL when windows['24h'].txs is not a finite number", () => {
+    const [r] = checkContent('latest.json', { windows: { '24h': { hours: 24, txs: 'nope' } }, series: Array(24).fill(1) });
+    assert.equal(r.status, 'FAIL');
+    assert.match(r.detail, /txs is not a finite number/i);
+  });
+
+  it("FAIL when windows['24h'].txs is 0", () => {
+    const [r] = checkContent('latest.json', { windows: { '24h': { hours: 24, txs: 0 } }, series: Array(24).fill(1) });
+    assert.equal(r.status, 'FAIL');
+    assert.match(r.detail, /txs is 0/i);
+  });
+
+  it('WARN when hours is 23 (boundary: < 24)', () => {
+    const r = checkContent('latest.json', {
+      windows: { '24h': { hours: 23, txs: 100 } },
+      series: Array(24).fill(1),
+    });
+    assert.ok(r.some((x) => x.status === 'WARN' && /hours.*23/.test(x.detail)));
+    assert.ok(r.every((x) => x.status !== 'FAIL'));
+  });
+
+  it('PASS when hours is exactly 24 (boundary: not < 24)', () => {
+    const [r] = checkContent('latest.json', {
+      windows: { '24h': { hours: 24, txs: 500 } },
+      series: Array(24).fill(1),
+    });
+    assert.equal(r.status, 'PASS');
+    assert.match(r.detail, /24h txs=500/);
+    assert.match(r.detail, /hours=24/);
+  });
+
+  it('WARN when series has fewer than 24 entries', () => {
+    const r = checkContent('latest.json', {
+      windows: { '24h': { hours: 24, txs: 100 } },
+      series: Array(10).fill(1),
+    });
+    assert.ok(r.some((x) => x.status === 'WARN' && /series.*10/.test(x.detail)));
+  });
+
+  it('WARN when series is absent', () => {
+    const r = checkContent('latest.json', {
+      windows: { '24h': { hours: 24, txs: 100 } },
+    });
+    assert.ok(r.some((x) => x.status === 'WARN' && /series/i.test(x.detail)));
+  });
+
+  it('PASS for a well-formed body with txs > 0 and series >= 24', () => {
+    const [r] = checkContent('latest.json', {
+      network: 'mainnet',
+      generatedAt: '2026-10-12T10:00:00.000Z',
+      windows: { '1h': { hours: 1, txs: 50 }, '24h': { hours: 24, txs: 1200 }, '7d': { hours: 168, txs: 8400 } },
+      series: Array(24).fill({ ts: 0, txs: 50 }),
+    });
+    assert.equal(r.status, 'PASS');
+    assert.match(r.detail, /txs=1200/);
+    assert.match(r.detail, /hours=24/);
+  });
+});
+
+// ---- apps-latest.json -------------------------------------------------------
+
+describe('checkContent – apps-latest.json', () => {
+  it('WARN on null body', () => {
+    const [r] = checkContent('apps-latest.json', null);
+    assert.equal(r.status, 'WARN');
+  });
+
+  it('WARN when coverageHours < 24', () => {
+    const r = checkContent('apps-latest.json', {
+      coverageHours: 12,
+      apps: { appA: {} },
+    });
+    assert.ok(r.some((x) => x.status === 'WARN' && /coverageHours/i.test(x.detail)));
+  });
+
+  it('FAIL when apps has no keys', () => {
+    const r = checkContent('apps-latest.json', { coverageHours: 24, apps: {} });
+    assert.ok(r.some((x) => x.status === 'FAIL' && /apps has no keys/i.test(x.detail)));
+  });
+
+  it('PASS when coverageHours >= 24 and apps has entries', () => {
+    const [r] = checkContent('apps-latest.json', { coverageHours: 48, apps: { a: {}, b: {} } });
+    assert.equal(r.status, 'PASS');
+    assert.match(r.detail, /2 apps/);
+  });
+});
+
+// ---- state.json -------------------------------------------------------------
+
+describe('checkContent – state.json', () => {
+  it('WARN on null body', () => {
+    const [r] = checkContent('state.json', null);
+    assert.equal(r.status, 'WARN');
+  });
+
+  it('WARN on array body', () => {
+    const [r] = checkContent('state.json', []);
+    assert.equal(r.status, 'WARN');
+  });
+
+  it('WARN on string body', () => {
+    const [r] = checkContent('state.json', 'bad');
+    assert.equal(r.status, 'WARN');
+  });
+
+  it('FAIL when chainId is not 5042', () => {
+    const r = checkContent('state.json', {
+      chainId: 1, next: 100, tip: 100, skipped: [],
+    });
+    assert.ok(r.some((x) => x.status === 'FAIL' && /chainId/i.test(x.detail)));
+  });
+
+  it('PASS when tip - next is exactly 500 (boundary: not > 500)', () => {
+    const r = checkContent('state.json', {
+      chainId: 5042, next: 0, tip: 500, skipped: [],
+    });
+    assert.ok(r.every((x) => x.status === 'PASS'));
+  });
+
+  it('WARN when tip - next is 501 (boundary: > 500)', () => {
+    const r = checkContent('state.json', {
+      chainId: 5042, next: 0, tip: 501, skipped: [],
+    });
+    assert.ok(r.some((x) => x.status === 'WARN' && /501/.test(x.detail)));
+  });
+
+  it('WARN when skipped is non-empty; detail lists ranges and total', () => {
+    // [[10,19],[100,100]] → 10 + 1 = 11 blocks total
+    const r = checkContent('state.json', {
+      chainId: 5042, next: 200, tip: 200,
+      skipped: [[10, 19], [100, 100]],
+    });
+    assert.ok(r.some((x) => x.status === 'WARN' && /2 range/.test(x.detail) && /11/.test(x.detail)));
+  });
+
+  it('PASS for a clean state with chainId 5042, small lag, no skipped', () => {
+    const [r] = checkContent('state.json', {
+      chainId: 5042, next: 1000, tip: 1050, skipped: [],
+    });
+    assert.equal(r.status, 'PASS');
+  });
+
+  it('real mainnet state: WARN about 211376 skipped blocks', () => {
+    // 25053371 - 24841996 + 1 = 211376
+    const body = {
+      next: 25581537,
+      tip: 25581536,
+      network: 'mainnet',
+      chainId: 5042,
+      openHour: '2026-10-12T12',
+      openHourStart: 25578482,
+      skipped: [[24841996, 25053371]],
+      updatedAt: '2026-10-12T12:26:01.625Z',
+    };
+    const r = checkContent('state.json', body);
+    // tip - next = -1, which is not > 500, so only the skipped WARN fires
+    assert.ok(r.some((x) => x.status === 'WARN' && /211376/.test(x.detail)));
+    // chainId is correct, so no FAIL
+    assert.ok(r.every((x) => x.status !== 'FAIL'));
+  });
+});
+
+// ---- supply.json ------------------------------------------------------------
+
+describe('checkContent – supply.json', () => {
+  it('WARN on null body', () => {
+    const [r] = checkContent('supply.json', null);
+    assert.equal(r.status, 'WARN');
+  });
+
+  it('FAIL when tokens.usdc.supply is missing', () => {
+    const [r] = checkContent('supply.json', { tokens: {} });
+    assert.equal(r.status, 'FAIL');
+    assert.match(r.detail, /supply/i);
+  });
+
+  it('FAIL when supply is 0', () => {
+    const [r] = checkContent('supply.json', { tokens: { usdc: { supply: 0 } } });
+    assert.equal(r.status, 'FAIL');
+  });
+
+  it('FAIL when supply is negative', () => {
+    const [r] = checkContent('supply.json', { tokens: { usdc: { supply: -1 } } });
+    assert.equal(r.status, 'FAIL');
+  });
+
+  it('FAIL when supply is a string', () => {
+    const [r] = checkContent('supply.json', { tokens: { usdc: { supply: 'big' } } });
+    assert.equal(r.status, 'FAIL');
+  });
+
+  it('PASS when supply is a positive finite number', () => {
+    const [r] = checkContent('supply.json', { tokens: { usdc: { supply: 1_000_000 } } });
+    assert.equal(r.status, 'PASS');
+    assert.match(r.detail, /supply=1000000/);
+  });
+});
+
+// ---- balances.json ----------------------------------------------------------
+
+describe('checkContent – balances.json', () => {
+  it('WARN on null body', () => {
+    const [r] = checkContent('balances.json', null);
+    assert.equal(r.status, 'WARN');
+  });
+
+  it('FAIL when total is not a finite number', () => {
+    const r = checkContent('balances.json', { total: 'nope', apps: { a: { usdc: 1 } } });
+    assert.ok(r.some((x) => x.status === 'FAIL' && /total/i.test(x.detail)));
+  });
+
+  it('FAIL when total is negative', () => {
+    const r = checkContent('balances.json', { total: -5, apps: { a: {} } });
+    assert.ok(r.some((x) => x.status === 'FAIL' && /total/i.test(x.detail)));
+  });
+
+  it('PASS when total is 0 (boundary: >= 0 is valid)', () => {
+    const [r] = checkContent('balances.json', { total: 0, apps: { a: {} } });
+    assert.equal(r.status, 'PASS');
+  });
+
+  it('FAIL when apps has no keys', () => {
+    const r = checkContent('balances.json', { total: 100, apps: {} });
+    assert.ok(r.some((x) => x.status === 'FAIL' && /apps/i.test(x.detail)));
+  });
+
+  it('PASS for valid total and non-empty apps', () => {
+    const [r] = checkContent('balances.json', { total: 42.5, apps: { x: { usdc: 42.5 } } });
+    assert.equal(r.status, 'PASS');
+    assert.match(r.detail, /total=42.5/);
+  });
+});
+
+// ---- agents.json ------------------------------------------------------------
+
+describe('checkContent – agents.json', () => {
+  it('WARN on null body', () => {
+    const [r] = checkContent('agents.json', null);
+    assert.equal(r.status, 'WARN');
+  });
+
+  it('FAIL when count is 0', () => {
+    const r = checkContent('agents.json', { count: 0, caughtUp: true, agents: [] });
+    assert.ok(r.some((x) => x.status === 'FAIL' && /count/i.test(x.detail)));
+  });
+
+  it('FAIL when count is negative', () => {
+    const r = checkContent('agents.json', { count: -1, caughtUp: true, agents: [] });
+    assert.ok(r.some((x) => x.status === 'FAIL' && /count/i.test(x.detail)));
+  });
+
+  it('FAIL when count is a string', () => {
+    const r = checkContent('agents.json', { count: 'many', caughtUp: true, agents: [] });
+    assert.ok(r.some((x) => x.status === 'FAIL' && /count/i.test(x.detail)));
+  });
+
+  it('WARN when caughtUp is false', () => {
+    const r = checkContent('agents.json', { count: 5, caughtUp: false, agents: [] });
+    assert.ok(r.some((x) => x.status === 'WARN' && /caughtUp/i.test(x.detail)));
+    assert.ok(r.every((x) => x.status !== 'FAIL'));
+  });
+
+  it('WARN when caughtUp is missing', () => {
+    const r = checkContent('agents.json', { count: 5, agents: [] });
+    assert.ok(r.some((x) => x.status === 'WARN' && /caughtUp/i.test(x.detail)));
+  });
+
+  it('PASS when count > 0 and caughtUp is true', () => {
+    const [r] = checkContent('agents.json', { count: 10, caughtUp: true, agents: [] });
+    assert.equal(r.status, 'PASS');
+    assert.match(r.detail, /count=10/);
+    assert.match(r.detail, /caughtUp=true/);
+  });
+});
+
+describe('checkContent boundaries (exact limits)', () => {
+  const win = (hours = 24) => ({ '24h': { hours, txs: 100 } })
+  const series = (n) => Array.from({ length: n }, (_, i) => ({ hour: `h${i}` }))
+
+  it('latest.json: a series of exactly 24 entries passes, 23 warns', () => {
+    const ok = checkContent('latest.json', { windows: win(), series: series(24) })
+    assert.deepEqual(ok.map((x) => x.status), ['PASS'])
+    const bad = checkContent('latest.json', { windows: win(), series: series(23) })
+    assert.ok(bad.some((x) => x.status === 'WARN' && /23 entries/.test(x.detail)))
+  })
+
+  it('apps-latest.json: coverageHours of exactly 24 passes, 23 warns', () => {
+    const ok = checkContent('apps-latest.json', { coverageHours: 24, apps: { a: {} } })
+    assert.deepEqual(ok.map((x) => x.status), ['PASS'])
+    const bad = checkContent('apps-latest.json', { coverageHours: 23, apps: { a: {} } })
+    assert.ok(bad.some((x) => x.status === 'WARN' && /coverageHours/.test(x.detail)))
+  })
+})
