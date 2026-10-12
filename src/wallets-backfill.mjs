@@ -259,10 +259,90 @@ function _markDay(r, day) {
   }
 }
 
-// ── 4. fetchWindow ────────────────────────────────────────────────────────────
+// ── 4. fetchWindow / fetchWindowStream ───────────────────────────────────────
 
 // Error messages that indicate the response range is too large.
 const TOO_LARGE_RE = /too many|limit|range|result/i
+
+/**
+ * Stream Transfer logs for USDC over [from, to] (inclusive) using the same
+ * splitting and rate-limit logic as fetchWindow, but:
+ *   (a) the two halves of every split are fetched SEQUENTIALLY (first half
+ *       is fully awaited before the second is started), so at most one
+ *       in-flight eth_getLogs request exists at any time; and
+ *   (b) every leaf answer (an array with < 9,500 logs) is handed to
+ *       `await onLogs(logs)` in ascending block order and then dropped —
+ *       arrays are never concatenated.
+ *
+ * Returns the total number of logs seen (sum of leaf array lengths).
+ *
+ * Peak memory: one leaf answer + whatever the caller accumulates in onLogs.
+ *
+ * @param {{
+ *   rpc: (method: string, params: any[]) => Promise<any>,
+ *   from: number,
+ *   to: number,
+ *   onLogs: (logs: object[]) => Promise<void>,
+ * }} opts
+ * @returns {Promise<number>}  Total log count
+ */
+export async function fetchWindowStream({ rpc, from, to, onLogs }) {
+  let backoff = 200  // ms, grows on rate-limit
+
+  // Returns the count of logs delivered via onLogs for the sub-range [f, t].
+  async function attempt(f, t) {
+    let result
+    try {
+      result = await rpc('eth_getLogs', [{
+        address: USDC,
+        topics: [TRANSFER_TOPIC],
+        fromBlock: '0x' + f.toString(16),
+        toBlock:   '0x' + t.toString(16),
+      }])
+    } catch (err) {
+      const code = err?.code ?? err?.error?.code
+      const msg  = err?.message ?? err?.error?.message ?? String(err)
+
+      // Rate-limit: retry with back-off (same endpoint — caller rotates if using buildRpc)
+      if (code === RATE_LIMIT_CODE || /rate.?limit/i.test(msg)) {
+        const sleep = Math.min(backoff, MAX_BACKOFF_MS)
+        backoff = Math.min(backoff * 2, MAX_BACKOFF_MS)
+        await new Promise((r) => setTimeout(r, sleep))
+        return attempt(f, t)
+      }
+
+      // Too-many-results style error → split SEQUENTIALLY
+      if (TOO_LARGE_RE.test(msg)) {
+        if (f === t) throw new Error(`eth_getLogs single block ${f} exceeded limit: ${msg}`)
+        const mid = Math.floor((f + t) / 2)
+        const countLeft  = await attempt(f, mid)          // first half fully done
+        const countRight = await attempt(mid + 1, t)      // then second half
+        return countLeft + countRight
+      }
+
+      throw err
+    }
+
+    if (!Array.isArray(result)) {
+      throw new Error(`eth_getLogs returned non-array for blocks ${f}-${t}`)
+    }
+
+    // Too many logs → split SEQUENTIALLY
+    if (result.length >= 9500) {
+      if (f === t) throw new Error(`eth_getLogs single block ${f} returned ${result.length} logs (>= 9500 limit)`)
+      const mid = Math.floor((f + t) / 2)
+      const countLeft  = await attempt(f, mid)           // first half fully done
+      const countRight = await attempt(mid + 1, t)       // then second half
+      return countLeft + countRight
+    }
+
+    // Leaf: deliver to caller and drop the array
+    await onLogs(result)
+    return result.length
+  }
+
+  return attempt(from, to)
+}
 
 /**
  * Fetch all Transfer logs for USDC over [from, to] (inclusive) block range.
@@ -275,6 +355,10 @@ const TOO_LARGE_RE = /too many|limit|range|result/i
  * Rate-limit (JSON-RPC code -32005): retried with growing back-off (doubles
  * each attempt, capped at MAX_BACKOFF_MS), rotating the endpoint on each retry.
  *
+ * This is a thin wrapper around fetchWindowStream that collects all leaf
+ * answers into a single array.  For memory-safe processing of large windows
+ * use fetchWindowStream directly.
+ *
  * @param {{
  *   rpc: (method: string, params: any[]) => Promise<any>,
  *   from: number,
@@ -283,56 +367,16 @@ const TOO_LARGE_RE = /too many|limit|range|result/i
  * @returns {Promise<object[]>}  All log entries
  */
 export async function fetchWindow({ rpc, from, to }) {
-  let backoff = 200  // ms, grows on rate-limit
-
-  async function attempt(f, t) {
-    let result
-    try {
-      result = await rpc('eth_getLogs', [{
-        address: USDC,
-        topics: [TRANSFER_TOPIC],
-        fromBlock: '0x' + f.toString(16),
-        toBlock:   '0x' + t.toString(16),
-      }])
-    } catch (err) {
-      // Check for rate-limit (JSON-RPC error object with code -32005)
-      const code = err?.code ?? err?.error?.code
-      const msg  = err?.message ?? err?.error?.message ?? String(err)
-
-      if (code === RATE_LIMIT_CODE || /rate.?limit/i.test(msg)) {
-        const sleep = Math.min(backoff, MAX_BACKOFF_MS)
-        backoff = Math.min(backoff * 2, MAX_BACKOFF_MS)
-        await new Promise((r) => setTimeout(r, sleep))
-        return attempt(f, t)
-      }
-
-      // Too-many-results style error → split
-      if (TOO_LARGE_RE.test(msg)) {
-        if (f === t) throw new Error(`eth_getLogs single block ${f} exceeded limit: ${msg}`)
-        const mid = Math.floor((f + t) / 2)
-        const [a, b] = await Promise.all([attempt(f, mid), attempt(mid + 1, t)])
-        return [...a, ...b]
-      }
-
-      throw err
-    }
-
-    if (!Array.isArray(result)) {
-      throw new Error(`eth_getLogs returned non-array for blocks ${f}-${t}`)
-    }
-
-    // Too many logs → split
-    if (result.length >= 9500) {
-      if (f === t) throw new Error(`eth_getLogs single block ${f} returned ${result.length} logs (>= 9500 limit)`)
-      const mid = Math.floor((f + t) / 2)
-      const [a, b] = await Promise.all([attempt(f, mid), attempt(mid + 1, t)])
-      return [...a, ...b]
-    }
-
-    return result
-  }
-
-  return attempt(from, to)
+  const collected = []
+  await fetchWindowStream({
+    rpc,
+    from,
+    to,
+    onLogs: async (logs) => {
+      for (const l of logs) collected.push(l)
+    },
+  })
+  return collected
 }
 
 // ── 5. runBackfill ────────────────────────────────────────────────────────────
@@ -463,17 +507,39 @@ export async function runBackfill({
     const t0 = Date.now()
     const windows = planWindows(dayStart, dayEnd, span)
 
-    // Collect all logs for this day
-    const allLogs = []
+    // Stream logs day by day — peak memory is one leaf answer plus this Map.
+    // Each leaf from fetchWindowStream is processed immediately and dropped.
+    const dayMap = new Map()
+    let totalLogsDay = 0
     for (const [wFrom, wTo] of windows) {
       callCount++
-      const logs = await fetchWindow({ rpc, from: wFrom, to: wTo })
-      // not push(...logs): a busy day returns >100k logs and spreading them into a call overflows the stack
-      for (const l of logs) allLogs.push(l)
+      await fetchWindowStream({
+        rpc,
+        from: wFrom,
+        to: wTo,
+        onLogs: async (logs) => {
+          totalLogsDay += logs.length
+          // Build records for this leaf (all blocks belong to `day`)
+          const leafMap = recordsFromLogs(logs, () => day, decimals)
+          // Merge leafMap into dayMap in place
+          for (const [addr, leafRec] of leafMap) {
+            if (!dayMap.has(addr)) {
+              dayMap.set(addr, leafRec)
+            } else {
+              const cur = dayMap.get(addr)
+              // Accumulate o and i with the same rounding recordsFromLogs uses
+              cur.o = +(cur.o + leafRec.o).toFixed(decimals)
+              cur.i = +(cur.i + leafRec.i).toFixed(decimals)
+              // f/l/d: all logs within a planned day carry the same day number,
+              // so _markDay is a no-op here; but we call it defensively to keep
+              // the bit-array consistent if day ever differs across a leaf.
+              _markDay(cur, leafRec.f)
+              if (leafRec.l !== leafRec.f) _markDay(cur, leafRec.l)
+            }
+          }
+        },
+      })
     }
-
-    // Build lite records
-    const dayMap = recordsFromLogs(allLogs, () => day, decimals)
 
     // Encode into pending shape
     const encoded = {}
@@ -499,7 +565,7 @@ export async function runBackfill({
     totalWallets += walletCount
     totalDays++
 
-    log(`backfill: day=${day} wallets=${walletCount} logs=${allLogs.length} secs=${elapsed}`)
+    log(`backfill: day=${day} wallets=${walletCount} logs=${totalLogsDay} secs=${elapsed}`)
   }
 
   log(`backfill: done days=${totalDays} wallets=${totalWallets} calls=${callCount}`)
@@ -538,16 +604,32 @@ export async function runPartialDay({
   span = 5000,
   decimals = 6,
 }) {
-  // Collect logs
+  // Stream logs — peak memory is one leaf answer plus the per-day address Map.
   const windows = planWindows(fromBlock, toBlock, span)
-  const allLogs = []
+  const newMap = new Map()
+  let totalLogs = 0
   for (const [wFrom, wTo] of windows) {
-    const logs = await fetchWindow({ rpc, from: wFrom, to: wTo })
-    for (const l of logs) allLogs.push(l)
+    await fetchWindowStream({
+      rpc,
+      from: wFrom,
+      to: wTo,
+      onLogs: async (logs) => {
+        totalLogs += logs.length
+        const leafMap = recordsFromLogs(logs, () => day, decimals)
+        for (const [addr, leafRec] of leafMap) {
+          if (!newMap.has(addr)) {
+            newMap.set(addr, leafRec)
+          } else {
+            const cur = newMap.get(addr)
+            cur.o = +(cur.o + leafRec.o).toFixed(decimals)
+            cur.i = +(cur.i + leafRec.i).toFixed(decimals)
+            _markDay(cur, leafRec.f)
+            if (leafRec.l !== leafRec.f) _markDay(cur, leafRec.l)
+          }
+        }
+      },
+    })
   }
-
-  // Build lite records for this partial day
-  const newMap = recordsFromLogs(allLogs, () => day, decimals)
 
   // Load existing pending file (or create empty one)
   let pending = await readJson(pendingPath, null)
@@ -572,7 +654,7 @@ export async function runPartialDay({
   await mkdir(dirname(pendingPath), { recursive: true })
   await writeJsonAtomic(pendingPath, pending)
 
-  return { wallets: newMap.size, logs: allLogs.length }
+  return { wallets: newMap.size, logs: totalLogs }
 }
 
 // ── RPC factory (used in CLI) ─────────────────────────────────────────────────

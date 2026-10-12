@@ -22,6 +22,7 @@ import {
   planWindows,
   recordsFromLogs,
   fetchWindow,
+  fetchWindowStream,
   partialDayRange,
   runBackfill,
   runPartialDay,
@@ -564,6 +565,17 @@ describe('runBackfill — one day with 180,000 transfer logs', () => {
     assert.equal(result.days, 2, `expected 2 days processed, got ${result.days}`)
     const meta = await readJson(join(dir, 'out', 'meta.json'))
     assert.equal(meta.through, 1)
+
+    // Streaming merges many leaf answers into one per-day map: both the SENT and the RECEIVED totals must be
+    // exact. Day 0 has 20 blocks x 9,000 logs and day 1 has 20 logs (1 per block), each 1 USDC from A to B: 180,020 sent by A and received by B in total.
+    const shardA = await readJson(join(dir, 'out', 's', 'aaa.json'))
+    const shardB = await readJson(join(dir, 'out', 's', 'bbb.json'))
+    const recA = shardA[ADDR_A], recB = shardB[ADDR_B]
+    assert.ok(recA && recB, 'both wallets must be in the shards')
+    assert.equal(recA[6], 180020, `A sent (o) must be 180020, got ${recA[6]}`)
+    assert.equal(recA[7], 0, 'A received nothing')
+    assert.equal(recB[7], 180020, `B received (i) must be 180020, got ${recB[7]}`)
+    assert.equal(recB[6], 0, 'B sent nothing')
   })
 })
 
@@ -862,5 +874,244 @@ describe('withPatience — success on first try never sleeps', () => {
 
     assert.equal(result, 42, 'should return 42')
     assert.equal(delays.length, 0, 'should not have slept')
+  })
+})
+
+// ── fetchWindowStream — new tests (a-e) ──────────────────────────────────────
+
+// (a) Leaves delivered in block order, no leaf >= 9500, count == sum of leaf sizes.
+describe('fetchWindowStream (a) — leaves in order, no leaf >= 9500, count correct', () => {
+  it('splits until leaves are small, delivers them in ascending block order', async () => {
+    // RPC: for a range wider than 2 blocks return 9500 logs; for a single block return 3 logs.
+    // This forces recursive binary splitting until single-block leaves.
+    const rpc = async (method, params) => {
+      const f = Number(BigInt(params[0].fromBlock))
+      const t = Number(BigInt(params[0].toBlock))
+      if (t - f >= 1) {
+        // Multi-block range: return 9500 logs to force a split
+        return Array.from({ length: 9500 }, (_, i) => makeLog(ADDR_A, ADDR_B, 1, f + (i % (t - f + 1))))
+      }
+      // Single block: return exactly 3 logs
+      return [makeLog(ADDR_A, ADDR_B, 1, f), makeLog(ADDR_B, ADDR_C, 1, f), makeLog(ADDR_C, ADDR_D, 1, f)]
+    }
+
+    const leafSizes = []
+    const leafFirstBlocks = []
+
+    const count = await fetchWindowStream({
+      rpc,
+      from: 0,
+      to: 3,  // 4 single-block leaves expected (0, 1, 2, 3)
+      onLogs: async (logs) => {
+        leafSizes.push(logs.length)
+        if (logs.length > 0) leafFirstBlocks.push(Number(BigInt(logs[0].blockNumber)))
+      },
+    })
+
+    // No leaf should have >= 9500 logs
+    for (const sz of leafSizes) {
+      assert.ok(sz < 9500, `leaf size ${sz} must be < 9500`)
+    }
+
+    // Sum of leaf sizes must equal the returned count
+    const sumSizes = leafSizes.reduce((s, n) => s + n, 0)
+    assert.equal(count, sumSizes, 'returned count must equal sum of leaf sizes')
+    assert.ok(count > 0, 'should have processed at least some logs')
+
+    // Leaves should be delivered in non-decreasing block order
+    for (let i = 1; i < leafFirstBlocks.length; i++) {
+      assert.ok(
+        leafFirstBlocks[i] >= leafFirstBlocks[i - 1],
+        `leaf ${i} first block ${leafFirstBlocks[i]} must be >= leaf ${i-1} first block ${leafFirstBlocks[i-1]}`,
+      )
+    }
+  })
+})
+
+// (b) Sequential splitting: maximum in-flight eth_getLogs calls is 1.
+describe('fetchWindowStream (b) — sequential splitting: max in-flight = 1', () => {
+  it('never has more than 1 concurrent eth_getLogs in flight', async () => {
+    let inFlight = 0
+    let maxInFlight = 0
+
+    const rpc = async (method, params) => {
+      const f = Number(BigInt(params[0].fromBlock))
+      const t = Number(BigInt(params[0].toBlock))
+
+      inFlight++
+      maxInFlight = Math.max(maxInFlight, inFlight)
+
+      // Simulate async work to expose any concurrency
+      await new Promise((r) => setTimeout(r, 1))
+
+      let result
+      if (t - f >= 1) {
+        // Return 9500 logs to force split
+        result = Array.from({ length: 9500 }, (_, i) => makeLog(ADDR_A, ADDR_B, 1, f))
+      } else {
+        result = [makeLog(ADDR_A, ADDR_B, 1, f)]
+      }
+
+      inFlight--
+      return result
+    }
+
+    await fetchWindowStream({
+      rpc,
+      from: 0,
+      to: 7,
+      onLogs: async () => {},
+    })
+
+    assert.equal(maxInFlight, 1, `max in-flight should be 1, got ${maxInFlight}`)
+  })
+})
+
+// (c) fetchWindow (wrapper) returns the same array content as before.
+describe('fetchWindow (c) — wrapper returns same array content as direct accumulation', () => {
+  it('splitting scenario produces same combined logs as single call', async () => {
+    const logsBlock0 = [makeLog(ADDR_A, ADDR_B, 1, 0), makeLog(ADDR_C, ADDR_D, 2, 0)]
+    const logsBlock1 = [makeLog(ADDR_B, ADDR_C, 3, 1)]
+
+    const rpc = async (method, params) => {
+      const f = Number(BigInt(params[0].fromBlock))
+      const t = Number(BigInt(params[0].toBlock))
+
+      // Wide range: trigger split via error
+      if (f === 0 && t === 1) throw new Error('too many results, limit exceeded')
+      // Halves
+      if (f === 0 && t === 0) return logsBlock0
+      if (f === 1 && t === 1) return logsBlock1
+      return []
+    }
+
+    const result = await fetchWindow({ rpc, from: 0, to: 1 })
+
+    // Should contain all 3 logs from both halves
+    assert.equal(result.length, 3, 'wrapper must collect all leaves')
+
+    const sortByBlock = (arr) => [...arr].sort((a, b) =>
+      Number(BigInt(a.blockNumber)) - Number(BigInt(b.blockNumber)),
+    )
+    const sorted = sortByBlock(result)
+    assert.equal(Number(BigInt(sorted[0].blockNumber)), 0)
+    assert.equal(Number(BigInt(sorted[2].blockNumber)), 1)
+  })
+})
+
+// (d) Equivalence: runBackfill on a busy chain (many logs per block, window splits) produces
+//     shard files identical to calling recordsFromLogs once on the full log array.
+describe('fetchWindowStream (d) — runBackfill streaming == full recordsFromLogs on same logs', () => {
+  it('shard files from streaming match reference built from the complete log array', async () => {
+    // 20 blocks per day, 3 days total (day 2 is untilDay).
+    // Days 0 and 1: 3,000 logs per block → 60,000 logs/day → window splits.
+    // Day 2 (untilDay): lighter, just used to set the boundary.
+    const BLOCKS_PER_DAY = 20
+    const LOGS_PER_BLOCK_BUSY = 3000
+    const blockTs = (b) => EPOCH_S + Math.floor(b / BLOCKS_PER_DAY) * 86400 + (b % BLOCKS_PER_DAY) * 10
+
+    // Pre-build the log arrays per block
+    const perBlock = new Map()
+    for (let b = 0; b < BLOCKS_PER_DAY * 3; b++) {
+      const day = Math.floor(b / BLOCKS_PER_DAY)
+      const count = day < 2 ? LOGS_PER_BLOCK_BUSY : 1
+      perBlock.set(b, Array.from({ length: count }, () => makeLog(ADDR_A, ADDR_B, 1, b)))
+    }
+
+    const rpc = async (method, params) => {
+      if (method === 'eth_getBlockByNumber') {
+        const bn = Number(BigInt(params[0]))
+        if (bn < 0 || bn > BLOCKS_PER_DAY * 3) throw new Error(`block ${bn} out of range`)
+        return { number: '0x' + bn.toString(16), timestamp: '0x' + blockTs(bn).toString(16) }
+      }
+      if (method === 'eth_getLogs') {
+        const f = Number(BigInt(params[0].fromBlock))
+        const t = Number(BigInt(params[0].toBlock))
+        const out = []
+        for (let b = f; b <= t; b++) for (const l of perBlock.get(b) ?? []) out.push(l)
+        return out
+      }
+      throw new Error(`unknown method ${method}`)
+    }
+
+    // A. Run backfill (streaming path)
+    const dirStream = tmpDir()
+    await runBackfill({
+      rpc,
+      outDir: join(dirStream, 'out'),
+      pendingDir: join(dirStream, 'pending'),
+      fromBlock: 0,
+      toBlock: BLOCKS_PER_DAY * 2,  // untilDay = day 2
+      span: 5000,
+      log: () => {},
+      net: 'testnet',
+    })
+
+    // B. Build reference output by feeding the complete log arrays directly to
+    //    recordsFromLogs then through encodeRecord/publish — no production code copied.
+    const dir2 = tmpDir()
+    const pendingPath2 = join(dir2, 'pending.json')
+    const outDir2 = join(dir2, 'out')
+
+    const daysObj = {}
+    for (let day = 0; day < 2; day++) {
+      const dayLogs = []
+      for (let b = day * BLOCKS_PER_DAY; b < (day + 1) * BLOCKS_PER_DAY; b++) {
+        for (const l of perBlock.get(b) ?? []) dayLogs.push(l)
+      }
+      const refMap = recordsFromLogs(dayLogs, () => day, 6)
+      const encoded = {}
+      for (const [addr, rec] of refMap) encoded[addr] = encodeRecord(rec)
+      daysObj[String(day)] = encoded
+    }
+    await writeJson(pendingPath2, { version: 1, dropped: 0, days: daysObj })
+    await publish({ pendingPath: pendingPath2, outDir: outDir2, today: 2, net: 'testnet' })
+
+    // C. Compare shard files for ADDR_A (the only active address)
+    const shardStream = await readJson(join(dirStream, 'out', 's', 'aaa.json'))
+    const shardRef    = await readJson(join(dir2,      'out', 's', 'aaa.json'))
+
+    assert.ok(shardStream, 'streaming backfill shard must exist')
+    assert.ok(shardRef,    'reference shard must exist')
+
+    const recStream = decodeShard(shardStream).get(ADDR_A.toLowerCase())
+    const recRef    = decodeShard(shardRef).get(ADDR_A.toLowerCase())
+
+    assert.ok(recStream, 'ADDR_A must be in streaming shard')
+    assert.ok(recRef,    'ADDR_A must be in reference shard')
+
+    assert.equal(recStream.o, recRef.o, `o (sent): streaming=${recStream.o} ref=${recRef.o}`)
+    assert.equal(recStream.f, recRef.f, `f: streaming=${recStream.f} ref=${recRef.f}`)
+    assert.equal(recStream.l, recRef.l, `l: streaming=${recStream.l} ref=${recRef.l}`)
+    assert.equal(recStream.d, recRef.d, `d bit-array: streaming=${recStream.d} ref=${recRef.d}`)
+  })
+})
+
+// (e) fetchWindowStream: rate-limit scenario still retries (same style as existing fetchWindow test).
+describe('fetchWindowStream (e) — rate-limit scenario retries and succeeds', () => {
+  it('retries after a -32005 rate-limit error and delivers the leaf', async () => {
+    const expectedLogs = [makeLog(ADDR_A, ADDR_B, 5, 10)]
+    let attempt = 0
+    const rpc = async () => {
+      attempt++
+      if (attempt < 3) {
+        const err = new Error('rate limit exceeded')
+        err.code = -32005
+        throw err
+      }
+      return expectedLogs
+    }
+
+    const delivered = []
+    const count = await fetchWindowStream({
+      rpc,
+      from: 0,
+      to: 100,
+      onLogs: async (logs) => { for (const l of logs) delivered.push(l) },
+    })
+
+    assert.deepEqual(delivered, expectedLogs, 'should have delivered the expected logs')
+    assert.equal(count, expectedLogs.length, 'count must equal delivered length')
+    assert.equal(attempt, 3, `should have tried 3 times (2 rate-limit failures + 1 success), got ${attempt}`)
   })
 })
