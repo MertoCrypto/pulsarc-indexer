@@ -25,6 +25,7 @@ import {
   partialDayRange,
   runBackfill,
   runPartialDay,
+  withPatience,
 } from '../src/wallets-backfill.mjs'
 
 import {
@@ -726,5 +727,94 @@ describe('partialDayRange — cut-over day range', () => {
   it('returns null when the cut is exactly at the day start or the day is unknown', () => {
     assert.equal(partialDayRange({ 283: 25400000 }, 283, 25400000), null)
     assert.equal(partialDayRange({}, 283, 25400000), null)
+  })
+})
+
+// ── withPatience ──────────────────────────────────────────────────────────────
+
+describe('withPatience — fails 3 times then succeeds', () => {
+  it('returns the result and records waits [15000, 30000, 60000]', async () => {
+    const delays = []
+    const fakeSleep = async (ms) => { delays.push(ms) }
+
+    let calls = 0
+    const fakeRpc = async () => {
+      calls++
+      if (calls <= 3) throw new Error('all RPC endpoints failed')
+      return 'ok'
+    }
+
+    const patient = withPatience(fakeRpc, { sleep: fakeSleep })
+    const result = await patient('eth_blockNumber', [])
+
+    assert.equal(result, 'ok', 'should return the successful result')
+    assert.deepEqual(delays, [15_000, 30_000, 60_000], 'waits should follow the schedule')
+  })
+})
+
+describe('withPatience — always fails, gives up when budget exhausted', () => {
+  it('rethrows original error and total waits do not exceed maxWaitMs + last wait', async () => {
+    const delays = []
+    const fakeSleep = async (ms) => { delays.push(ms) }
+
+    const originalErr = new Error('all RPC endpoints failed')
+    const fakeRpc = async () => { throw originalErr }
+
+    const maxWaitMs = 300_000
+    const patient = withPatience(fakeRpc, { sleep: fakeSleep, maxWaitMs })
+
+    let thrown
+    try {
+      await patient('eth_blockNumber', [])
+    } catch (e) {
+      thrown = e
+    }
+
+    assert.ok(thrown, 'should have thrown')
+    assert.equal(thrown, originalErr, 'should rethrow the original error object')
+
+    const totalWaited = delays.reduce((s, d) => s + d, 0)
+    // The last sleep recorded is always within the budget; the next would exceed it.
+    assert.ok(
+      totalWaited <= maxWaitMs,
+      `total waited ${totalWaited} should be <= maxWaitMs ${maxWaitMs}`,
+    )
+  })
+})
+
+describe('withPatience — different error is rethrown immediately', () => {
+  it('rethrows a non-rate-limit error with no sleep', async () => {
+    const delays = []
+    const fakeSleep = async (ms) => { delays.push(ms) }
+
+    const boom = new Error('boom')
+    const fakeRpc = async () => { throw boom }
+
+    const patient = withPatience(fakeRpc, { sleep: fakeSleep })
+
+    let thrown
+    try {
+      await patient('eth_blockNumber', [])
+    } catch (e) {
+      thrown = e
+    }
+
+    assert.equal(thrown, boom, 'should rethrow boom immediately')
+    assert.equal(delays.length, 0, 'should not have slept')
+  })
+})
+
+describe('withPatience — success on first try never sleeps', () => {
+  it('returns immediately without calling sleep', async () => {
+    const delays = []
+    const fakeSleep = async (ms) => { delays.push(ms) }
+
+    const fakeRpc = async () => 42
+
+    const patient = withPatience(fakeRpc, { sleep: fakeSleep })
+    const result = await patient('eth_blockNumber', [])
+
+    assert.equal(result, 42, 'should return 42')
+    assert.equal(delays.length, 0, 'should not have slept')
   })
 })

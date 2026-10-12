@@ -652,6 +652,81 @@ export function buildRpc(urls) {
   }
 }
 
+// ── 7. withPatience ───────────────────────────────────────────────────────────
+
+/**
+ * Wrap an `rpc` function so that sustained rate-limiting is survived rather
+ * than treated as a fatal error.
+ *
+ * Retry conditions (either triggers a wait-and-retry cycle):
+ *   • The thrown Error message is exactly 'all RPC endpoints failed'
+ *   • The thrown error has `code === -32005`
+ *
+ * Any other error is re-thrown immediately (no retry).
+ *
+ * Wait schedule (seconds): 15, 30, 60, 120, 120, 120 … (capped at 120 s).
+ * The cycle gives up (re-throws the last error) once the total time spent
+ * waiting for a SINGLE call would exceed `maxWaitMs` (default 20 min).
+ *
+ * One console.warn line is emitted per wait:
+ *   [rpc] still rate-limited; waiting <s>s (<elapsed>s of <max>s)
+ *
+ * @param {(method: string, params: any[]) => Promise<any>} rpc
+ * @param {{
+ *   maxWaitMs?: number,
+ *   sleep?: (ms: number) => Promise<void>,
+ * }} [opts]
+ * @returns {(method: string, params: any[]) => Promise<any>}
+ */
+export function withPatience(rpc, opts = {}) {
+  const maxWaitMs = opts.maxWaitMs ?? 20 * 60 * 1000
+  const sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)))
+
+  // Back-off schedule in ms: 15 s, 30 s, 60 s, 120 s, then stay at 120 s.
+  const SCHEDULE = [15_000, 30_000, 60_000, 120_000]
+  const SCHEDULE_CAP = 120_000
+
+  return async function patientRpc(method, params) {
+    let totalWaited = 0
+    let attempt = 0
+    let lastErr
+
+    for (;;) {
+      try {
+        return await rpc(method, params)
+      } catch (err) {
+        const isRateLimit =
+          err?.message === 'all RPC endpoints failed' ||
+          err?.code === -32005
+
+        if (!isRateLimit) throw err
+
+        lastErr = err
+
+        const waitMs = attempt < SCHEDULE.length
+          ? SCHEDULE[attempt]
+          : SCHEDULE_CAP
+
+        // Give up before sleeping if this wait would push us over the budget.
+        if (totalWaited + waitMs > maxWaitMs) {
+          throw lastErr
+        }
+
+        const waitS   = (waitMs   / 1000).toFixed(0)
+        const elapsedS = (totalWaited / 1000).toFixed(0)
+        const maxS    = (maxWaitMs  / 1000).toFixed(0)
+        console.warn(
+          `[rpc] still rate-limited; waiting ${waitS}s (${elapsedS}s of ${maxS}s)`,
+        )
+
+        await sleep(waitMs)
+        totalWaited += waitMs
+        attempt++
+      }
+    }
+  }
+}
+
 /**
  * Block range of the partial cut-over day: from the first block of `untilDay` up to the block BEFORE
  * `untilBlock` (the live indexer covers untilBlock onward). Returns null when there is nothing to scan
@@ -708,7 +783,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     process.exit(1)
   }
 
-  const rpc = buildRpc(rawUrls)
+  const rpc = withPatience(buildRpc(rawUrls))
   const pendingDir = join(outDir, 'pending')
 
   try {
