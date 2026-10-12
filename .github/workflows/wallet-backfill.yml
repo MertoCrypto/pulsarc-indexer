@@ -37,4 +37,5 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FROM_BLOCK: ${{ inputs.from_block }}
+          NODE_OPTIONS: --max-old-space-size=5120   # the runner has 7 GB; the default heap ran out on a busy day
         run: ./scripts/backfill-wallets.sh "${{ inputs.net }}"
