@@ -521,6 +521,52 @@ describe('runBackfill — 4-day synthetic chain produces correct shard files', (
   })
 })
 
+// ── runBackfill — a very busy day (regression: allLogs.push(...logs) overflowed the stack) ──
+
+describe('runBackfill — one day with 180,000 transfer logs', () => {
+  it('processes the day instead of throwing RangeError (Maximum call stack size exceeded)', async () => {
+    // 2 days x 20 blocks; block 40 opens day 2 (the untilDay). Every block of day 0 carries 9,000 logs,
+    // so one day's logs (180,000) come back from a single planned window after fetchWindow splits it.
+    const BLOCKS_PER_DAY = 20
+    const blockTs = (b) => EPOCH_S + Math.floor(b / BLOCKS_PER_DAY) * 86400 + (b % BLOCKS_PER_DAY) * 10
+    const heavy = (b) => (b < BLOCKS_PER_DAY ? 9000 : 1)
+    const perBlock = new Map()
+    for (let b = 0; b < 40; b++) perBlock.set(b, new Array(heavy(b)).fill(makeLog(ADDR_A, ADDR_B, 1, b)))
+
+    const rpc = async (method, params) => {
+      if (method === 'eth_getBlockByNumber') {
+        const bn = Number(BigInt(params[0]))
+        if (bn < 0 || bn > 40) throw new Error(`block ${bn} out of range`)
+        return { number: '0x' + bn.toString(16), timestamp: '0x' + blockTs(bn).toString(16) }
+      }
+      if (method === 'eth_getLogs') {
+        const f = Number(BigInt(params[0].fromBlock))
+        const t = Number(BigInt(params[0].toBlock))
+        const out = []
+        for (let b = f; b <= t; b++) for (const l of perBlock.get(b) ?? []) out.push(l)
+        return out
+      }
+      throw new Error(`unknown method ${method}`)
+    }
+
+    const dir = tmpDir()
+    const result = await runBackfill({
+      rpc,
+      outDir: join(dir, 'out'),
+      pendingDir: join(dir, 'pending'),
+      fromBlock: 0,
+      toBlock: 40,
+      span: 5000,
+      log: () => {},
+      net: 'testnet',
+    })
+
+    assert.equal(result.days, 2, `expected 2 days processed, got ${result.days}`)
+    const meta = await readJson(join(dir, 'out', 'meta.json'))
+    assert.equal(meta.through, 1)
+  })
+})
+
 // ── runBackfill — kill-and-resume ─────────────────────────────────────────────
 
 describe('runBackfill — kill-and-resume produces same result', () => {

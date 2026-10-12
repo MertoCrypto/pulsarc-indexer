@@ -468,7 +468,8 @@ export async function runBackfill({
     for (const [wFrom, wTo] of windows) {
       callCount++
       const logs = await fetchWindow({ rpc, from: wFrom, to: wTo })
-      allLogs.push(...logs)
+      // not push(...logs): a busy day returns >100k logs and spreading them into a call overflows the stack
+      for (const l of logs) allLogs.push(l)
     }
 
     // Build lite records
@@ -542,7 +543,7 @@ export async function runPartialDay({
   const allLogs = []
   for (const [wFrom, wTo] of windows) {
     const logs = await fetchWindow({ rpc, from: wFrom, to: wTo })
-    allLogs.push(...logs)
+    for (const l of logs) allLogs.push(l)
   }
 
   // Build lite records for this partial day
