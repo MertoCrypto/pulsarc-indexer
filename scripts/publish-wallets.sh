@@ -27,6 +27,8 @@ fi
 
 cp "$PENDING" "${PENDING}.bak"
 NET="$NET" node src/wallets-publish.mjs wallets-out
+# distribution boundaries for the site's percentile line; best-effort, a failure here must never block the publish
+node src/wallets-dist.mjs wallets-out || echo "wallets: dist.json skipped" >&2
 
 cd wallets-out
 git init -q -b "$BRANCH"
