@@ -20,6 +20,12 @@ export const EPOCH_S = 1767225600   // Date.UTC(2026, 0, 1) / 1000
 const ZERO = '0x' + '0'.repeat(40)
 const HEX_ADDR_RE = /^0x[0-9a-fA-F]{40}$/
 
+/**
+ * Maximum number of entries stored in each set field of ext (ut, un, uc).
+ * When the union exceeds this cap, keep the lexicographically first 64 entries.
+ */
+export const SET_CAP = 64
+
 // ── 1. shardOf ────────────────────────────────────────────────────────────────
 
 /**
@@ -53,6 +59,8 @@ export function dayOf(timestampSeconds) {
 
 /**
  * Create an empty wallet record for a wallet first seen on `day`.
+ * Returns EXACTLY 11 keys: f, l, d, t, x, e, o, i, a, bo, bi.
+ * The optional `ext` field is never present on a fresh record.
  *
  * @param {number} day  result of dayOf()
  * @returns {object}
@@ -157,19 +165,194 @@ export function bridgeAddrs(net) {
   }
 }
 
+// ── ext helpers ───────────────────────────────────────────────────────────────
+
+/**
+ * Return the 8 lowercase hex chars right after '0x' of a lowercased address.
+ * Used as the compact key stored in ut/un/uc sets.
+ *
+ * @param {string} addr  lowercase 0x-prefixed address
+ * @returns {string}  8 hex chars
+ */
+function addrPrefix(addr) {
+  return addr.slice(2, 10)
+}
+
+/**
+ * Merge two sorted prefix arrays: union, sort ascending, cap at SET_CAP.
+ *
+ * @param {string[]|undefined} a
+ * @param {string[]|undefined} b
+ * @returns {string[]}
+ */
+function mergeSet(a, b) {
+  const set = new Set(a ?? [])
+  for (const v of b ?? []) set.add(v)
+  const arr = Array.from(set).sort()
+  if (arr.length > SET_CAP) arr.length = SET_CAP
+  return arr
+}
+
+/**
+ * Add a single prefix to a sorted set array, cap at SET_CAP.
+ * Returns the same array reference if unchanged; otherwise a new sorted array.
+ *
+ * @param {string[]|undefined} arr
+ * @param {string} prefix
+ * @returns {string[]}
+ */
+function addToSet(arr, prefix) {
+  if (!arr) return [prefix]
+  if (arr.includes(prefix)) return arr
+  const next = arr.concat(prefix).sort()
+  if (next.length > SET_CAP) next.length = SET_CAP
+  return next
+}
+
+/**
+ * Return the hour bucket index (0-3) for a UTC hour (0-23).
+ *   0 → [00,06)   hours 0-5
+ *   1 → [06,12)   hours 6-11
+ *   2 → [12,18)   hours 12-17
+ *   3 → [18,24)   hours 18-23
+ * Returns -1 for invalid input (non-integer, out of range).
+ *
+ * @param {*} hour
+ * @returns {number}  0|1|2|3 or -1
+ */
+export function hourBucket(hour) {
+  if (typeof hour !== 'number' || !Number.isInteger(hour) || hour < 0 || hour > 23) return -1
+  return Math.floor(hour / 6)
+}
+
+/**
+ * Ensure `rec.ext` exists and return it.
+ * @param {object} rec
+ * @returns {object}
+ */
+function ensureExt(rec) {
+  if (!rec.ext) rec.ext = {}
+  return rec.ext
+}
+
+/**
+ * Merge two ext objects.  Either may be undefined/null.
+ * Returns undefined when both are absent; otherwise a fresh object with merged fields.
+ *
+ * Rules:
+ *   dp  — sum
+ *   h   — element-wise sum of 4-element arrays
+ *   tt  — sum
+ *   ut  — union set, cap at SET_CAP
+ *   un  — union set, cap at SET_CAP
+ *   uc  — union set, cap at SET_CAP
+ *
+ * @param {object|undefined} ea
+ * @param {object|undefined} eb
+ * @returns {object|undefined}
+ */
+function mergeExt(ea, eb) {
+  if (!ea && !eb) return undefined
+  const a = ea ?? {}
+  const b = eb ?? {}
+
+  const out = {}
+
+  const dp = (a.dp ?? 0) + (b.dp ?? 0)
+  if (dp) out.dp = dp
+
+  const ha = a.h, hb = b.h
+  if (ha || hb) {
+    const ha0 = ha ?? [0, 0, 0, 0]
+    const hb0 = hb ?? [0, 0, 0, 0]
+    out.h = [ha0[0] + hb0[0], ha0[1] + hb0[1], ha0[2] + hb0[2], ha0[3] + hb0[3]]
+  }
+
+  const tt = (a.tt ?? 0) + (b.tt ?? 0)
+  if (tt) out.tt = tt
+
+  const ut = mergeSet(a.ut, b.ut)
+  if (ut.length) out.ut = ut
+
+  const un = mergeSet(a.un, b.un)
+  if (un.length) out.un = un
+
+  const uc = mergeSet(a.uc, b.uc)
+  if (uc.length) out.uc = uc
+
+  return Object.keys(out).length ? out : undefined
+}
+
+/**
+ * Return derived counts from a record's ext field.
+ * All fields are zero / null / false when ext is absent.
+ *
+ * @param {object} rec
+ * @returns {{
+ *   deployments: number,
+ *   transfers: number,
+ *   tokens: number,
+ *   nfts: number,
+ *   contracts: number,
+ *   tokensCapped: boolean,
+ *   nftsCapped: boolean,
+ *   contractsCapped: boolean,
+ *   hours: [number,number,number,number]|null
+ * }}
+ */
+export function extCounts(rec) {
+  const e = rec.ext
+  if (!e) {
+    return {
+      deployments: 0,
+      transfers: 0,
+      tokens: 0,
+      nfts: 0,
+      contracts: 0,
+      tokensCapped: false,
+      nftsCapped: false,
+      contractsCapped: false,
+      hours: null,
+    }
+  }
+  const tokens    = (e.ut ?? []).length
+  const nfts      = (e.un ?? []).length
+  const contracts = (e.uc ?? []).length
+  return {
+    deployments:    e.dp ?? 0,
+    transfers:      e.tt ?? 0,
+    tokens,
+    nfts,
+    contracts,
+    tokensCapped:    tokens    === SET_CAP,
+    nftsCapped:      nfts      === SET_CAP,
+    contractsCapped: contracts === SET_CAP,
+    hours: e.h ?? null,
+  }
+}
+
 // ── 6. walletDeltas ──────────────────────────────────────────────────────────
 
 /**
  * Compute per-wallet deltas from one block's receipts.
  *
  * @param {object[]} receipts  eth_getBlockReceipts output
- * @param {{ day: number, usdcDecimals: number, appIndex: Map<string,number>, net?: string }} ctx
+ * @param {{
+ *   day: number,
+ *   usdcDecimals: number,
+ *   appIndex: Map<string,number>,
+ *   net?: string,
+ *   hour?: number   optional UTC hour (0-23); when present and valid, records hour-bucket counts in ext.h
+ * }} ctx
  * @returns {Map<string, object>}  lowercase address → delta record
  */
 export function walletDeltas(receipts, ctx) {
   const { day, usdcDecimals, appIndex } = ctx
   const net = ctx.net ?? process.env.NET ?? 'testnet'
   const { tokenMessenger, messageTransmitter } = bridgeAddrs(net)
+
+  // Determine hour bucket once for the whole block (-1 = do not record)
+  const hBucket = hourBucket(ctx.hour)
 
   const deltas = new Map()   // lowercase addr → live record (sums for this block)
 
@@ -213,6 +396,13 @@ export function walletDeltas(receipts, ctx) {
     sender.e = +(sender.e + fee).toFixed(6)
     markActive(from)
 
+    // ext.h — hour bucket for ALL sent tx (including failed)
+    if (hBucket >= 0) {
+      const ext = ensureExt(sender)
+      if (!ext.h) ext.h = [0, 0, 0, 0]
+      ext.h[hBucket]++
+    }
+
     // App bits from receipt.to
     if (receipt.to) {
       const toAddr = receipt.to.toLowerCase()
@@ -231,6 +421,26 @@ export function walletDeltas(receipts, ctx) {
       const logAddr = log.address.toLowerCase()
       const logIdx  = appIndex.get(logAddr)
       if (logIdx !== undefined) addAppBit(from, logIdx)
+    }
+
+    // ext.dp — contract deployment (receipt.contractAddress is a non-null string)
+    if (receipt.contractAddress != null && typeof receipt.contractAddress === 'string') {
+      const ext = ensureExt(sender)
+      ext.dp = (ext.dp ?? 0) + 1
+    }
+
+    // ext.uc — contracts called by sender:
+    //   receipt.to (lowercase), non-null, AND some log in receipt has log.address === receipt.to
+    //   AND receipt.to !== sender (the "called contract emitted an event" rule)
+    if (receipt.to) {
+      const toAddr = receipt.to.toLowerCase()
+      if (toAddr !== from) {
+        const toEmitted = logs.some((l) => l.address?.toLowerCase() === toAddr)
+        if (toEmitted) {
+          const ext = ensureExt(sender)
+          ext.uc = addToSet(ext.uc, addrPrefix(toAddr))
+        }
+      }
     }
 
     // ── USDC Transfer logs ───────────────────────────────────────────────────
@@ -254,6 +464,46 @@ export function walletDeltas(receipts, ctx) {
         const r = getDelta(toAddr)
         r.i = +(r.i + amount).toFixed(6)
         markActive(toAddr)
+      }
+    }
+
+    // ── ERC-20 and ERC-721 Transfer logs for ext.tt / ext.ut / ext.un ────────
+    //
+    // Process all Transfer logs (any token contract) in SUCCESSFUL receipts.
+    // 3-topic = ERC-20, 4-topic = ERC-721.
+    // For each, the `from` and `to` parties (ignoring zero address) each get:
+    //   tt++   (transfer count)
+    //   ut (ERC-20) or un (ERC-721) updated with the token contract prefix
+    // If from === to, still count once.
+
+    for (const log of logs) {
+      if (!log.topics) continue
+      if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue
+      const nTopics = log.topics.length
+      if (nTopics !== 3 && nTopics !== 4) continue
+
+      const isERC20 = nTopics === 3
+      const logAddr = log.address?.toLowerCase()
+      if (!logAddr) continue
+
+      const tFrom = ('0x' + log.topics[1].slice(-40)).toLowerCase()
+      const tTo   = ('0x' + log.topics[2].slice(-40)).toLowerCase()
+      const prefix = addrPrefix(logAddr)
+
+      // Collect the distinct non-zero parties; if from===to count once
+      const parties = []
+      if (tFrom !== ZERO) parties.push(tFrom)
+      if (tTo !== ZERO && tTo !== tFrom) parties.push(tTo)
+
+      for (const party of parties) {
+        const r = getDelta(party)
+        const ext = ensureExt(r)
+        ext.tt = (ext.tt ?? 0) + 1
+        if (isERC20) {
+          ext.ut = addToSet(ext.ut, prefix)
+        } else {
+          ext.un = addToSet(ext.un, prefix)
+        }
       }
     }
 
@@ -311,6 +561,8 @@ export function walletDeltas(receipts, ctx) {
 
 /**
  * Pure merge of two wallet records.  Does NOT mutate either input.
+ * Both records may optionally carry an `ext` field; the result has `ext` only
+ * if at least one side does.
  *
  * @param {object} a  existing record
  * @param {object} b  delta record
@@ -334,7 +586,7 @@ export function mergeRecords(a, b) {
   const aB = BigInt('0x' + (b.a || '0'))
   const aMerged = (aA | aB).toString(16)
 
-  return {
+  const merged = {
     f: newF,
     l: newL,
     d: dMerged,
@@ -347,6 +599,11 @@ export function mergeRecords(a, b) {
     bo: a.bo + b.bo,
     bi: a.bi + b.bi,
   }
+
+  const mergedExt = mergeExt(a.ext, b.ext)
+  if (mergedExt !== undefined) merged.ext = mergedExt
+
+  return merged
 }
 
 /**
@@ -371,17 +628,26 @@ export function mergeInto(map, addr, delta) {
 const KEYS = ['f', 'l', 'd', 't', 'x', 'e', 'o', 'i', 'a', 'bo', 'bi']
 
 /**
- * Encode a record to a compact array [f,l,d,t,x,e,o,i,a,bo,bi].
+ * Encode a record to a compact array [f,l,d,t,x,e,o,i,a,bo,bi[,ext]].
+ * The 12th element (ext) is included only when rec.ext is a non-null object
+ * with at least one key; omitting it keeps the array at 11 elements for
+ * backward compatibility with consumers that do not know about ext.
  *
  * @param {object} rec
  * @returns {Array}
  */
 export function encodeRecord(rec) {
-  return KEYS.map((k) => rec[k] ?? (k === 'd' || k === 'a' ? '0' : 0))
+  const arr = KEYS.map((k) => rec[k] ?? (k === 'd' || k === 'a' ? '0' : 0))
+  if (rec.ext != null && typeof rec.ext === 'object' && Object.keys(rec.ext).length > 0) {
+    arr.push(rec.ext)
+  }
+  return arr
 }
 
 /**
  * Decode an array back to a record.
+ * Accepts arrays of length 11 or 12.
+ * rec.ext is set only when arr[11] is a non-null object.
  *
  * @param {Array} arr
  * @returns {object}
@@ -389,6 +655,9 @@ export function encodeRecord(rec) {
 export function decodeRecord(arr) {
   const rec = {}
   for (let i = 0; i < KEYS.length; i++) rec[KEYS[i]] = arr[i]
+  if (arr.length >= 12 && arr[11] !== null && typeof arr[11] === 'object' && !Array.isArray(arr[11])) {
+    rec.ext = arr[11]
+  }
   return rec
 }
 

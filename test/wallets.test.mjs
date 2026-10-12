@@ -10,6 +10,7 @@ import {
   walletDeltas, mergeRecords, mergeInto,
   encodeRecord, decodeRecord, encodeShard, decodeShard,
   activeDayCount, ageDays, appsOf,
+  SET_CAP, extCounts, hourBucket,
 } from '../src/wallets.mjs'
 
 import {
@@ -457,5 +458,552 @@ describe('mergeRecords — every numeric field is summed', () => {
     assert.equal(m.bo, 4)
     assert.equal(m.bi, 6)
     assert.equal(m.a, '3')
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════════
+// NEW TESTS: backward compat
+// ════════════════════════════════════════════════════════════════════════════════
+
+describe('backward compat — emptyRecord has exactly 11 keys', () => {
+  it('emptyRecord returns no ext and exactly the 11 expected keys', () => {
+    const rec = emptyRecord(0)
+    const keys = Object.keys(rec)
+    assert.deepEqual(keys.sort(), ['a', 'bi', 'bo', 'd', 'e', 'f', 'i', 'l', 'o', 't', 'x'].sort())
+    assert.ok(!('ext' in rec), 'ext must not be present on an empty record')
+  })
+})
+
+describe('backward compat — old 11-element arrays decode/encode unchanged', () => {
+  it('encodeRecord without ext produces exactly 11 elements', () => {
+    const rec = { f: 1, l: 2, d: 'a', t: 5, x: 1, e: 0.5, o: 10, i: 3, a: 'f', bo: 2, bi: 1 }
+    const arr = encodeRecord(rec)
+    assert.equal(arr.length, 11)
+    assert.deepEqual(arr, [1, 2, 'a', 5, 1, 0.5, 10, 3, 'f', 2, 1])
+  })
+
+  it('decodeRecord on 11-element array produces no ext', () => {
+    const arr = [1, 2, 'a', 5, 1, 0.5, 10, 3, 'f', 2, 1]
+    const rec = decodeRecord(arr)
+    assert.ok(!('ext' in rec), 'ext must not appear when arr has 11 elements')
+    assert.equal(rec.f, 1)
+    assert.equal(rec.bi, 1)
+  })
+
+  it('round-trip: old record encodes to same 11-element array as before', () => {
+    const rec = { f: 10, l: 20, d: '3f', t: 42, x: 1, e: 0.001234, o: 99.5, i: 0, a: 'ff', bo: 3, bi: 1 }
+    const arr = encodeRecord(rec)
+    assert.equal(arr.length, 11)
+    const rt = decodeRecord(arr)
+    for (const k of Object.keys(rec)) {
+      assert.equal(rt[k], rec[k], `${k} must survive round-trip`)
+    }
+    assert.ok(!('ext' in rt))
+  })
+
+  it('12-element round-trip preserves ext', () => {
+    const rec = { f: 0, l: 1, d: '1', t: 3, x: 0, e: 0, o: 0, i: 0, a: '0', bo: 0, bi: 0,
+                  ext: { dp: 2, tt: 5, ut: ['aabbccdd'] } }
+    const arr = encodeRecord(rec)
+    assert.equal(arr.length, 12, '12th element must be present when ext is non-empty')
+    assert.deepEqual(arr[11], rec.ext)
+    const rt = decodeRecord(arr)
+    assert.ok(rt.ext, 'ext must survive round-trip')
+    assert.equal(rt.ext.dp, 2)
+    assert.equal(rt.ext.tt, 5)
+    assert.deepEqual(rt.ext.ut, ['aabbccdd'])
+  })
+
+  it('decodeRecord on length-12 array with null ext does not set rec.ext', () => {
+    const base = [0, 1, '1', 3, 0, 0, 0, 0, '0', 0, 0]
+    const arr = base.concat([null])
+    assert.equal(arr.length, 12)
+    const rec = decodeRecord(arr)
+    assert.ok(!('ext' in rec), 'null ext must not be set on rec')
+  })
+
+  it('encodeRecord with empty ext object does not emit 12th element', () => {
+    const rec = { f: 0, l: 0, d: '0', t: 0, x: 0, e: 0, o: 0, i: 0, a: '0', bo: 0, bi: 0,
+                  ext: {} }
+    const arr = encodeRecord(rec)
+    assert.equal(arr.length, 11, 'empty ext must not produce a 12th element')
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════════
+// NEW TESTS: hourBucket
+// ════════════════════════════════════════════════════════════════════════════════
+
+describe('hourBucket', () => {
+  it('hour 0 → bucket 0', ()  => assert.equal(hourBucket(0),  0))
+  it('hour 5 → bucket 0', ()  => assert.equal(hourBucket(5),  0))
+  it('hour 6 → bucket 1', ()  => assert.equal(hourBucket(6),  1))
+  it('hour 11 → bucket 1', () => assert.equal(hourBucket(11), 1))
+  it('hour 12 → bucket 2', () => assert.equal(hourBucket(12), 2))
+  it('hour 17 → bucket 2', () => assert.equal(hourBucket(17), 2))
+  it('hour 18 → bucket 3', () => assert.equal(hourBucket(18), 3))
+  it('hour 23 → bucket 3', () => assert.equal(hourBucket(23), 3))
+  it('hour -1 → -1 (invalid)', () => assert.equal(hourBucket(-1), -1))
+  it('hour 24 → -1 (invalid)', () => assert.equal(hourBucket(24), -1))
+  it('hour 1.5 → -1 (non-integer)', () => assert.equal(hourBucket(1.5), -1))
+  it('"3" (string) → -1', ()         => assert.equal(hourBucket('3'), -1))
+})
+
+// ════════════════════════════════════════════════════════════════════════════════
+// NEW TESTS: walletDeltas — ext facts
+// ════════════════════════════════════════════════════════════════════════════════
+
+// ── ext.dp — contract deployments ────────────────────────────────────────────
+
+describe('walletDeltas — ext.dp (deployments)', () => {
+  it('successful deploy increments dp for sender', () => {
+    const r = receipt({ from: A, contractAddress: '0x' + 'c'.repeat(40), status: '0x1' })
+    const map = walletDeltas([r], ctx)
+    const rec = map.get(A.toLowerCase())
+    assert.equal(rec.ext?.dp, 1)
+  })
+
+  it('failed receipt with contractAddress does NOT increment dp', () => {
+    // spec says: receipt.contractAddress is non-null AND receipt.status === '0x1'
+    // a failed tx has status '0x0' so dp should not increment
+    const r = receipt({ from: A, contractAddress: '0x' + 'c'.repeat(40), status: '0x0' })
+    const map = walletDeltas([r], ctx)
+    const rec = map.get(A.toLowerCase())
+    // dp must be absent or 0
+    assert.ok(!rec.ext?.dp, 'dp must not be set for failed deploy')
+  })
+
+  it('plain call (no contractAddress) does not set dp', () => {
+    const r = receipt({ from: A, to: B, status: '0x1' })
+    const map = walletDeltas([r], ctx)
+    const rec = map.get(A.toLowerCase())
+    assert.ok(!rec.ext?.dp, 'no dp for plain call')
+  })
+
+  it('two deploys in same block → dp=2', () => {
+    const r1 = receipt({ from: A, contractAddress: '0x' + '1'.repeat(40), status: '0x1' })
+    const r2 = receipt({ from: A, contractAddress: '0x' + '2'.repeat(40), status: '0x1' })
+    const map = walletDeltas([r1, r2], ctx)
+    assert.equal(map.get(A.toLowerCase()).ext?.dp, 2)
+  })
+})
+
+// ── ext.h — hour bucket counts ────────────────────────────────────────────────
+
+describe('walletDeltas — ext.h (hour buckets)', () => {
+  it('ctx.hour absent → no h recorded', () => {
+    const map = walletDeltas([receipt({ from: A })], ctx)   // ctx has no .hour
+    const rec = map.get(A.toLowerCase())
+    assert.ok(!rec.ext?.h, 'h must not appear when ctx.hour is absent')
+  })
+
+  it('ctx.hour=0 (bucket 0) → h=[1,0,0,0]', () => {
+    const map = walletDeltas([receipt({ from: A })], { ...ctx, hour: 0 })
+    const rec = map.get(A.toLowerCase())
+    assert.deepEqual(rec.ext.h, [1, 0, 0, 0])
+  })
+
+  it('ctx.hour=7 (bucket 1) → h=[0,1,0,0]', () => {
+    const map = walletDeltas([receipt({ from: A })], { ...ctx, hour: 7 })
+    const rec = map.get(A.toLowerCase())
+    assert.deepEqual(rec.ext.h, [0, 1, 0, 0])
+  })
+
+  it('ctx.hour=23 (bucket 3) → h=[0,0,0,1]', () => {
+    const map = walletDeltas([receipt({ from: A })], { ...ctx, hour: 23 })
+    const rec = map.get(A.toLowerCase())
+    assert.deepEqual(rec.ext.h, [0, 0, 0, 1])
+  })
+
+  it('burst of 3 tx in bucket 2 → h=[0,0,3,0]', () => {
+    const rs = [
+      receipt({ from: A }),
+      receipt({ from: A }),
+      receipt({ from: A }),
+    ]
+    const map = walletDeltas(rs, { ...ctx, hour: 12 })
+    assert.deepEqual(map.get(A.toLowerCase()).ext.h, [0, 0, 3, 0])
+  })
+
+  it('failed tx still counts in h', () => {
+    const rs = [
+      receipt({ from: A, status: '0x1' }),
+      receipt({ from: A, status: '0x0' }),   // failed
+    ]
+    const map = walletDeltas(rs, { ...ctx, hour: 0 })
+    // both tx by sender should be counted (h tracks ALL sent tx)
+    assert.deepEqual(map.get(A.toLowerCase()).ext.h, [2, 0, 0, 0])
+  })
+
+  it('ctx.hour=24 (invalid) → no h recorded', () => {
+    const map = walletDeltas([receipt({ from: A })], { ...ctx, hour: 24 })
+    const rec = map.get(A.toLowerCase())
+    assert.ok(!rec.ext?.h, 'h must not appear for invalid hour')
+  })
+
+  it('ctx.hour=1.5 (non-integer) → no h recorded', () => {
+    const map = walletDeltas([receipt({ from: A })], { ...ctx, hour: 1.5 })
+    const rec = map.get(A.toLowerCase())
+    assert.ok(!rec.ext?.h, 'h must not appear for non-integer hour')
+  })
+})
+
+// ── ext.tt / ext.ut / ext.un — Transfer-log counts and token sets ─────────────
+
+// Helper: make a generic ERC-20 Transfer log (any token contract)
+function erc20TransferLog(tokenAddr, from, to) {
+  return {
+    address: tokenAddr,
+    topics: [TRANSFER_TOPIC, addrTopic(from), addrTopic(to)],
+    data: '0x' + '0'.repeat(64),
+  }
+}
+
+// Helper: make an ERC-721 Transfer log (4 topics; topics[3] = tokenId)
+function erc721TransferLog(nftAddr, from, to) {
+  return {
+    address: nftAddr,
+    topics: [TRANSFER_TOPIC, addrTopic(from), addrTopic(to), '0x' + '1'.padStart(64, '0')],
+    data: '0x',
+  }
+}
+
+const TOK1 = '0x' + '1'.repeat(40)   // a fictional ERC-20
+const TOK2 = '0x' + '2'.repeat(40)   // another ERC-20
+const NFT1 = '0x' + 'd'.repeat(40)   // a fictional ERC-721
+
+describe('walletDeltas — ext.tt / ext.ut / ext.un (Transfer logs)', () => {
+  it('ERC-20 Transfer: both parties get tt=1 and ut with the token prefix', () => {
+    const log = erc20TransferLog(TOK1, A, B)
+    const map = walletDeltas([receipt({ from: A, logs: [log] })], ctx)
+    const rA = map.get(A.toLowerCase())
+    const rB = map.get(B.toLowerCase())
+    assert.equal(rA.ext?.tt, 1, 'A tt')
+    assert.equal(rB.ext?.tt, 1, 'B tt')
+    const prefix = TOK1.slice(2, 10)   // '11111111'
+    assert.ok(rA.ext?.ut?.includes(prefix), 'A ut has TOK1 prefix')
+    assert.ok(rB.ext?.ut?.includes(prefix), 'B ut has TOK1 prefix')
+  })
+
+  it('ERC-721 Transfer: both parties get tt=1 and un (not ut) with the contract prefix', () => {
+    const log = erc721TransferLog(NFT1, A, B)
+    const map = walletDeltas([receipt({ from: A, logs: [log] })], ctx)
+    const rA = map.get(A.toLowerCase())
+    const rB = map.get(B.toLowerCase())
+    assert.equal(rA.ext?.tt, 1, 'A tt')
+    assert.equal(rB.ext?.tt, 1, 'B tt')
+    const prefix = NFT1.slice(2, 10)
+    assert.ok(rA.ext?.un?.includes(prefix), 'A un has NFT1 prefix')
+    assert.ok(rB.ext?.un?.includes(prefix), 'B un has NFT1 prefix')
+    // ut must NOT be set
+    assert.ok(!(rA.ext?.ut?.includes(prefix)), 'A ut must NOT have NFT1 prefix')
+  })
+
+  it('self-transfer (from === to, non-zero) is counted exactly once', () => {
+    const log = erc20TransferLog(TOK1, A, A)
+    const map = walletDeltas([receipt({ from: A, logs: [log] })], ctx)
+    const rA = map.get(A.toLowerCase())
+    assert.equal(rA.ext?.tt, 1, 'self-transfer counted once')
+    assert.equal(rA.ext?.ut?.length, 1, 'ut has exactly one entry')
+  })
+
+  it('zero-address as from is ignored (mint-style)', () => {
+    const log = erc20TransferLog(TOK1, ZERO, B)
+    const map = walletDeltas([receipt({ from: A, logs: [log] })], ctx)
+    assert.ok(!map.has(ZERO), 'zero address must not get a delta')
+    // B still gets tt=1 because it is a non-zero party
+    assert.equal(map.get(B.toLowerCase()).ext?.tt, 1)
+  })
+
+  it('zero-address as to is ignored (burn-style)', () => {
+    const log = erc20TransferLog(TOK1, A, ZERO)
+    const map = walletDeltas([receipt({ from: A, logs: [log] })], ctx)
+    assert.ok(!map.has(ZERO), 'zero address must not get a delta')
+    assert.equal(map.get(A.toLowerCase()).ext?.tt, 1)
+  })
+
+  it('both parties zero → no party gets tt', () => {
+    const log = erc20TransferLog(TOK1, ZERO, ZERO)
+    const map = walletDeltas([receipt({ from: A, logs: [log] })], ctx)
+    // Neither zero-address party should appear; sender A gets nothing from the log
+    assert.ok(!map.get(A.toLowerCase())?.ext?.tt)
+  })
+
+  it('Transfer log on failed receipt does not count', () => {
+    const log = erc20TransferLog(TOK1, A, B)
+    const map = walletDeltas([receipt({ from: A, status: '0x0', logs: [log] })], ctx)
+    const rA = map.get(A.toLowerCase())
+    assert.ok(!rA.ext?.tt, 'tt must not be set from failed receipt logs')
+  })
+})
+
+// ── ext.uc — called contracts ─────────────────────────────────────────────────
+
+const CONTRACT1 = '0x' + 'e'.repeat(40)   // a fictional contract
+
+describe('walletDeltas — ext.uc (called contracts)', () => {
+  it('contract call: receipt.to emits a log → uc gets to prefix', () => {
+    const log = { address: CONTRACT1, topics: ['0xdeadbeef'], data: '0x' }
+    const map = walletDeltas([receipt({ from: A, to: CONTRACT1, logs: [log] })], ctx)
+    const rec = map.get(A.toLowerCase())
+    const prefix = CONTRACT1.slice(2, 10)
+    assert.ok(rec.ext?.uc?.includes(prefix), 'uc must contain CONTRACT1 prefix')
+  })
+
+  it('receipt.to === sender → uc rule does NOT apply', () => {
+    // When the sender calls themselves (to === from), uc should not be set
+    const log = { address: A, topics: ['0xdeadbeef'], data: '0x' }
+    const map = walletDeltas([receipt({ from: A, to: A, logs: [log] })], ctx)
+    const rec = map.get(A.toLowerCase())
+    assert.ok(!rec.ext?.uc?.length, 'uc must not be set when to === sender')
+  })
+
+  it('receipt.to has no log in the receipt → uc not set', () => {
+    // Contract1 is the target but the only log is from a different address
+    const log = { address: B, topics: ['0xdeadbeef'], data: '0x' }
+    const map = walletDeltas([receipt({ from: A, to: CONTRACT1, logs: [log] })], ctx)
+    const rec = map.get(A.toLowerCase())
+    const prefix = CONTRACT1.slice(2, 10)
+    assert.ok(!(rec.ext?.uc?.includes(prefix)), 'uc must not be set when to emits no log')
+  })
+
+  it('receipt.to is null (deploy) → uc not set', () => {
+    const r = receipt({ from: A, to: null, contractAddress: '0x' + '9'.repeat(40), status: '0x1' })
+    const map = walletDeltas([r], ctx)
+    const rec = map.get(A.toLowerCase())
+    assert.ok(!rec.ext?.uc?.length, 'uc must not be set for deploy (to=null)')
+  })
+
+  it('failed receipt: uc not set even if to emits a log', () => {
+    const log = { address: CONTRACT1, topics: ['0xdeadbeef'], data: '0x' }
+    const map = walletDeltas([receipt({ from: A, to: CONTRACT1, status: '0x0', logs: [log] })], ctx)
+    const rec = map.get(A.toLowerCase())
+    assert.ok(!rec.ext?.uc?.length, 'uc must not be set for failed receipt')
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════════
+// NEW TESTS: mergeRecords with ext
+// ════════════════════════════════════════════════════════════════════════════════
+
+describe('mergeRecords — ext handling', () => {
+  it('both sides lack ext → result has no ext', () => {
+    const a = emptyRecord(0)
+    const b = emptyRecord(0)
+    const m = mergeRecords(a, b)
+    assert.ok(!('ext' in m), 'no ext when both sides lack it')
+  })
+
+  it('only one side has ext → result carries it', () => {
+    const a = { ...emptyRecord(0), ext: { dp: 3 } }
+    const b = emptyRecord(0)
+    const m1 = mergeRecords(a, b)
+    assert.equal(m1.ext?.dp, 3)
+    const m2 = mergeRecords(b, a)
+    assert.equal(m2.ext?.dp, 3)
+  })
+
+  it('dp is summed across sides', () => {
+    const a = { ...emptyRecord(0), ext: { dp: 2 } }
+    const b = { ...emptyRecord(0), ext: { dp: 5 } }
+    const m = mergeRecords(a, b)
+    assert.equal(m.ext.dp, 7)
+  })
+
+  it('tt is summed across sides', () => {
+    const a = { ...emptyRecord(0), ext: { tt: 10 } }
+    const b = { ...emptyRecord(0), ext: { tt: 4 } }
+    const m = mergeRecords(a, b)
+    assert.equal(m.ext.tt, 14)
+  })
+
+  it('h arrays are element-wise summed', () => {
+    const a = { ...emptyRecord(0), ext: { h: [1, 2, 3, 4] } }
+    const b = { ...emptyRecord(0), ext: { h: [10, 0, 5, 1] } }
+    const m = mergeRecords(a, b)
+    assert.deepEqual(m.ext.h, [11, 2, 8, 5])
+  })
+
+  it('h: one side missing h → treated as [0,0,0,0]', () => {
+    const a = { ...emptyRecord(0), ext: { h: [3, 0, 0, 0] } }
+    const b = { ...emptyRecord(0), ext: { dp: 1 } }   // no h
+    const m = mergeRecords(a, b)
+    assert.deepEqual(m.ext.h, [3, 0, 0, 0])
+  })
+
+  it('ut sets are unioned and sorted', () => {
+    const a = { ...emptyRecord(0), ext: { ut: ['cccccccc', 'aaaaaaaa'] } }
+    const b = { ...emptyRecord(0), ext: { ut: ['bbbbbbbb', 'aaaaaaaa'] } }
+    const m = mergeRecords(a, b)
+    assert.deepEqual(m.ext.ut, ['aaaaaaaa', 'bbbbbbbb', 'cccccccc'])
+  })
+
+  it('un sets are unioned', () => {
+    const a = { ...emptyRecord(0), ext: { un: ['dddddddd'] } }
+    const b = { ...emptyRecord(0), ext: { un: ['eeeeeeee'] } }
+    const m = mergeRecords(a, b)
+    assert.deepEqual(m.ext.un, ['dddddddd', 'eeeeeeee'])
+  })
+
+  it('uc sets are unioned', () => {
+    const a = { ...emptyRecord(0), ext: { uc: ['11111111'] } }
+    const b = { ...emptyRecord(0), ext: { uc: ['22222222'] } }
+    const m = mergeRecords(a, b)
+    assert.deepEqual(m.ext.uc, ['11111111', '22222222'])
+  })
+
+  it('set capped at 64 with deterministic truncation (lexicographic first 64)', () => {
+    // Build two sets of 40 prefixes each with 16 in common → union = 64 entries
+    // prefixes are hex-sortable 8-char strings
+    const make = (start, count) =>
+      Array.from({ length: count }, (_, i) =>
+        (start + i).toString(16).padStart(8, '0')
+      )
+    const aSet = make(0, 40)
+    const bSet = make(24, 40)   // overlaps aSet[24..39], adds 24 new entries above 39
+    const a = { ...emptyRecord(0), ext: { ut: aSet } }
+    const b = { ...emptyRecord(0), ext: { ut: bSet } }
+    const m = mergeRecords(a, b)
+    assert.equal(m.ext.ut.length, SET_CAP, 'union must be capped at SET_CAP')
+    // The kept entries are the lexicographically smallest SET_CAP items
+    const allUnion = Array.from(new Set([...aSet, ...bSet])).sort()
+    const expected = allUnion.slice(0, SET_CAP)
+    assert.deepEqual(m.ext.ut, expected)
+  })
+
+  it('inputs are not mutated when both have ext', () => {
+    const a = { ...emptyRecord(0), ext: { dp: 1, ut: ['aaaaaaaa'] } }
+    const b = { ...emptyRecord(0), ext: { dp: 2, ut: ['bbbbbbbb'] } }
+    const aCopy = JSON.parse(JSON.stringify(a))
+    const bCopy = JSON.parse(JSON.stringify(b))
+    mergeRecords(a, b)
+    assert.deepEqual(a, aCopy, 'a must not be mutated')
+    assert.deepEqual(b, bCopy, 'b must not be mutated')
+  })
+
+  it('merged ext with all-zero/empty fields does not appear in result', () => {
+    // If two sides both have ext but with all zeros, the merged ext is empty → absent
+    // (In practice this is unusual, but mergeExt should handle it)
+    const a = { ...emptyRecord(0), ext: { dp: 0, tt: 0 } }
+    const b = { ...emptyRecord(0), ext: { dp: 0 } }
+    const m = mergeRecords(a, b)
+    // dp and tt are both 0 → falsy → not written to out
+    assert.ok(!m.ext || Object.keys(m.ext).length === 0, 'no non-zero ext fields expected')
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════════
+// NEW TESTS: extCounts
+// ════════════════════════════════════════════════════════════════════════════════
+
+describe('extCounts', () => {
+  it('no ext → all zeros, hours null, no capped flags', () => {
+    const rec = emptyRecord(0)
+    const c = extCounts(rec)
+    assert.equal(c.deployments, 0)
+    assert.equal(c.transfers, 0)
+    assert.equal(c.tokens, 0)
+    assert.equal(c.nfts, 0)
+    assert.equal(c.contracts, 0)
+    assert.equal(c.tokensCapped, false)
+    assert.equal(c.nftsCapped, false)
+    assert.equal(c.contractsCapped, false)
+    assert.equal(c.hours, null)
+  })
+
+  it('ext with dp, tt, h → correct deployments, transfers, hours', () => {
+    const rec = { ...emptyRecord(0), ext: { dp: 3, tt: 7, h: [1, 2, 3, 4] } }
+    const c = extCounts(rec)
+    assert.equal(c.deployments, 3)
+    assert.equal(c.transfers, 7)
+    assert.deepEqual(c.hours, [1, 2, 3, 4])
+  })
+
+  it('tokens/nfts/contracts counted from set lengths', () => {
+    const rec = {
+      ...emptyRecord(0),
+      ext: {
+        ut: ['aabbccdd', '11223344'],
+        un: ['eeff0011'],
+        uc: ['deadbeef', 'cafebabe', '12345678'],
+      },
+    }
+    const c = extCounts(rec)
+    assert.equal(c.tokens, 2)
+    assert.equal(c.nfts, 1)
+    assert.equal(c.contracts, 3)
+  })
+
+  it('tokensCapped is true when ut.length === SET_CAP', () => {
+    const ut = Array.from({ length: SET_CAP }, (_, i) => i.toString(16).padStart(8, '0'))
+    const rec = { ...emptyRecord(0), ext: { ut } }
+    const c = extCounts(rec)
+    assert.equal(c.tokensCapped, true)
+  })
+
+  it('nftsCapped is true when un.length === SET_CAP', () => {
+    const un = Array.from({ length: SET_CAP }, (_, i) => i.toString(16).padStart(8, '0'))
+    const rec = { ...emptyRecord(0), ext: { un } }
+    const c = extCounts(rec)
+    assert.equal(c.nftsCapped, true)
+  })
+
+  it('contractsCapped is true when uc.length === SET_CAP', () => {
+    const uc = Array.from({ length: SET_CAP }, (_, i) => i.toString(16).padStart(8, '0'))
+    const rec = { ...emptyRecord(0), ext: { uc } }
+    const c = extCounts(rec)
+    assert.equal(c.contractsCapped, true)
+  })
+
+  it('tokensCapped is false when ut.length < SET_CAP', () => {
+    const rec = { ...emptyRecord(0), ext: { ut: ['aabbccdd'] } }
+    const c = extCounts(rec)
+    assert.equal(c.tokensCapped, false)
+  })
+})
+
+// ── Pinning tests (added after mutation check) ───────────────────────────────
+
+describe('ext pinning', () => {
+  it('SET_CAP is 64', () => {
+    assert.equal(SET_CAP, 64)
+  })
+
+  it('merge of two full-and-different sets truncates to the 64 smallest', () => {
+    const make = (start, count) =>
+      Array.from({ length: count }, (_, i) => (start + i).toString(16).padStart(8, '0'))
+    const aSet = make(0, 64)
+    const bSet = make(100, 64)
+    const m = mergeRecords(
+      { ...emptyRecord(0), ext: { uc: aSet } },
+      { ...emptyRecord(0), ext: { uc: bSet } },
+    )
+    assert.equal(m.ext.uc.length, 64)
+    assert.deepEqual(m.ext.uc, aSet)
+  })
+
+  it('hour buckets add element-wise in merge (all four positions)', () => {
+    const m = mergeRecords(
+      { ...emptyRecord(0), ext: { h: [1, 2, 3, 4] } },
+      { ...emptyRecord(0), ext: { h: [10, 20, 30, 40] } },
+    )
+    assert.deepEqual(m.ext.h, [11, 22, 33, 44])
+  })
+
+  it('receipt with contractAddress: null is not a deployment', () => {
+    const map = walletDeltas([receipt({ from: A, contractAddress: null })], ctx)
+    assert.equal(map.get(A.toLowerCase()).ext?.dp, undefined)
+  })
+
+  it('decodeRecord ignores an array in the 12th slot', () => {
+    const arr = [...encodeRecord(emptyRecord(0)), [1, 2]]
+    assert.equal('ext' in decodeRecord(arr), false)
+  })
+
+  it('the same token seen twice is stored once', () => {
+    const logs = [erc20TransferLog(TOK1, A, B), erc20TransferLog(TOK1, A, B)]
+    const map = walletDeltas([receipt({ from: A, to: C, logs })], ctx)
+    assert.deepEqual(map.get(A.toLowerCase()).ext.ut, ['11111111'])
+    assert.equal(map.get(A.toLowerCase()).ext.tt, 2)
   })
 })

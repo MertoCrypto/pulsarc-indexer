@@ -471,6 +471,7 @@ function accumulateWalletBlock(receipts, blockTs, usdcDec, blockNum) {
     usdcDecimals: usdcDec,
     appIndex: walletAppIndex,
     net: NET,
+    hour: Number.isFinite(blockTs) ? Math.floor((blockTs % 86400) / 3600) : undefined,
   })
 
   for (const [addr, delta] of deltas) {
