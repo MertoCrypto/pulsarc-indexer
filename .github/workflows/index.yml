@@ -50,7 +50,7 @@ jobs:
           NOTIFY_NETS: testnet
           NOTIFY_KINDS: anomaly,daily,health,rank,contract,agents,weekly
           WALLET_INDEX: '1'
-        run: NET=testnet BUDGET_SECONDS=300 BACKFILL_HOURS=24 node src/run.mjs && NET=testnet node src/summarize.mjs && NET=testnet node src/supply.mjs && NET=testnet node src/label.mjs && NET=testnet node src/extras.mjs
+        run: NET=testnet BUDGET_SECONDS=300 BACKFILL_HOURS=24 node src/run.mjs && NET=testnet node src/summarize.mjs && NET=testnet node src/supply.mjs && NET=testnet node src/fx.mjs && NET=testnet node src/label.mjs && NET=testnet node src/extras.mjs
 
       # Daily: merge closed UTC days of the wallet index into the `wallets-testnet` branch. Cheap no-op otherwise.
       - name: Publish wallet index (testnet)
