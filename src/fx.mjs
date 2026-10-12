@@ -158,7 +158,7 @@ function offsetHour(hourStr, n) {
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 // Only runs when this file is the entry point.
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   await runCli()
 }
 

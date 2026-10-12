@@ -218,7 +218,7 @@ export async function writeDist(dir, now = new Date()) {
 
 // ── 7. CLI ────────────────────────────────────────────────────────────────────
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const dir = process.argv[2]
   if (!dir) {
     console.error('Usage: node src/wallets-dist.mjs <dir>')
