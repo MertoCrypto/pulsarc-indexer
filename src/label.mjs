@@ -7,20 +7,12 @@
 import { readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { KNOWN, decodeString } from './labelCore.mjs'
 
 const NET = process.env.NET === 'testnet' ? 'testnet' : 'mainnet'
 const RPC = NET === 'testnet' ? 'https://rpc.testnet.arc.io' : 'https://rpc.mainnet.arc.io'
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', 'data', NET)
 const MAX_NEW = 120 // new addresses labelled per run, keeps the run short
-
-// Well-known singletons that exist at the same address on every EVM chain.
-const KNOWN = {
-  '0x000000000022d473030f116ddee9f6b43ac78ba3': { name: 'Permit2', kind: 'infra' },
-  '0x0000000071727de22e5e9d8baf0edac6f37da032': { name: 'ERC-4337 EntryPoint v0.7', kind: 'account-abstraction' },
-  '0x5ff137d4b0fdcd49dca30c7cf57e578a026d2789': { name: 'ERC-4337 EntryPoint v0.6', kind: 'account-abstraction' },
-  '0xca11bde05977b3631167028862be2a173976ca11': { name: 'Multicall3', kind: 'infra' },
-  '0x3600000000000000000000000000000000000000': { name: 'USDC', kind: 'token' },
-}
 
 const NAME = '0x06fdde03'
 const SYMBOL = '0x95d89b41'
@@ -35,19 +27,6 @@ async function rpc(calls) {
     await new Promise((r) => setTimeout(r, 700 * 1.8 ** attempt))
   }
   throw new Error('rpc failed')
-}
-
-/** Decodes an ABI-encoded string return value; returns null for anything that is not one. */
-function decodeString(hex) {
-  if (!hex || hex === '0x' || hex.length < 130) return null
-  try {
-    const bytes = Buffer.from(hex.slice(2), 'hex')
-    const offset = Number(BigInt('0x' + bytes.subarray(0, 32).toString('hex')))
-    const len = Number(BigInt('0x' + bytes.subarray(offset, offset + 32).toString('hex')))
-    if (len === 0 || len > 80) return null
-    const s = bytes.subarray(offset + 32, offset + 32 + len).toString('utf8')
-    return /^[\x20-\x7e -￿]+$/.test(s) ? s.trim() : null
-  } catch { return null }
 }
 
 const readJson = async (p, f) => { try { return JSON.parse(await readFile(p, 'utf8')) } catch { return f } }
