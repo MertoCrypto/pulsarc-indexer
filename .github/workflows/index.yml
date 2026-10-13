@@ -43,6 +43,14 @@ jobs:
           WALLET_INDEX: ${{ vars.WALLET_INDEX_MAINNET }}
         run: NET=mainnet BUDGET_SECONDS=1200 node src/run.mjs && NET=mainnet node src/summarize.mjs && NET=mainnet node src/supply.mjs && (NET=mainnet node src/balances.mjs || echo "balances failed") && (NET=mainnet node src/agents-activity.mjs || echo "agents-activity failed") && NET=mainnet node src/label.mjs && NET=mainnet node src/extras.mjs
 
+      # Token + NFT catalogue (data/mainnet/catalog.json). Needs labels.json and discover.json from the step above.
+      # Probes at most 400 new addresses per run, so the first full catalogue takes a few runs.
+      # Stays off until the repository variable CATALOG_MAINNET is set to 1; a failure never blocks publishing.
+      - name: Build catalogue (mainnet)
+        if: ${{ vars.CATALOG_MAINNET == '1' }}
+        continue-on-error: true
+        run: NET=mainnet node src/catalog.mjs
+
       - name: Index Arc Testnet
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
