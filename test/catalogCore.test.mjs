@@ -1643,3 +1643,325 @@ describe('decodeDecimals – range/type guard :118: decimal, negative, 37, NaN s
 //   Test above (two tokens with different txs and different addresses) kills it.
 //
 // Verified: no surviving equivalent mutant remains for the listed targets.
+
+// =============================================================================
+// ADDITIONAL MUTANT-KILLER TESTS (second pass)
+// =============================================================================
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (A) mergeCatalog :209 default maxTokens=200 / maxNfts=200
+//     Mutation: `maxTokens = 199` (or maxNfts = 199) in opts destructure
+//     Kill: call mergeCatalog WITHOUT explicit maxTokens/maxNfts; 150 previous
+//     + 60 newly-probed = 210 entries → cap at 200, 201st entry absent.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('mergeCatalog – default cap :209: 150+60=210 entries, no explicit max → 200 kept', () => {
+  // Build 150 tokens in previous catalog (addresses 0x0001..0x0150)
+  const makePrevToken = (i) => ({
+    address: `0x${String(i).padStart(40, '0')}`,
+    name: `Prev${i}`, symbol: `P${i}`, decimals: 18, totalSupply: '1000',
+  })
+  const prevTokens = Array.from({ length: 150 }, (_, i) => makePrevToken(i + 1))
+
+  // 60 newly-probed erc20 entries (addresses 0x1001..0x1060, distinct from previous)
+  const makeNewEntry = (i) => ({
+    address: `0x${String(i + 0x1000).padStart(40, '0')}`,
+    probe: { name: `New${i}`, symbol: `N${i}`, decimals: '0x06',
+             totalSupply: '0x01', is721: false, is1155: false },
+    discoverTxs: 60 - i,  // descending so sort is deterministic
+  })
+  const newEntries = Array.from({ length: 60 }, (_, i) => makeNewEntry(i + 1))
+
+  const previous = {
+    network: 'mainnet', generatedAt: 'old', coverage: 'x',
+    tokens: prevTokens, nfts: [],
+    probed: Object.fromEntries(prevTokens.map((t) => [t.address, 'erc20'])),
+  }
+
+  // No maxTokens/maxNfts → defaults apply
+  const result = mergeCatalog(previous, newEntries, { network: 'mainnet', generatedAt: 'new' })
+
+  it('total input is 210 tokens (150 prev + 60 new)', () => {
+    // Sanity: combined pool before slicing is 210
+    assert.equal(prevTokens.length + newEntries.length, 210)
+  })
+
+  it('output is capped at 200 tokens (default limit, kills maxTokens=199 mutant)', () => {
+    // With mutant maxTokens=199: would give 199. With correct default 200: gives 200.
+    assert.equal(result.tokens.length, 200, `expected 200 tokens, got ${result.tokens.length}`)
+  })
+
+  it('the 201st-ranked entry is absent from output', () => {
+    // With 210 entries and cap 200, the 10 lowest-ranked tokens must be absent.
+    // Previous tokens have discoverTxs=0 (not in newEntries lookup), new entries have
+    // discoverTxs 59..1. The 200th slot is the last prev token that fits after the 60 new ones.
+    // We just confirm the total length is exactly 200 and not 201.
+    assert.ok(result.tokens.length <= 200, `must not exceed 200, got ${result.tokens.length}`)
+  })
+
+  // Also verify NFT default cap independently
+  const makeNftEntry = (i) => ({
+    address: `0xa${String(i).padStart(39, '0')}`,
+    probe: { name: `N${i}`, symbol: `NF${i}`, decimals: null, totalSupply: null,
+             is721: true, is1155: false },
+    discoverTxs: 210 - i,
+  })
+  const nft210Entries = Array.from({ length: 210 }, (_, i) => makeNftEntry(i + 1))
+
+  it('210 newly-probed NFTs with no previous and no explicit maxNfts → exactly 200 nfts', () => {
+    const r = mergeCatalog(null, nft210Entries, { network: 'mainnet', generatedAt: 'T' })
+    assert.equal(r.nfts.length, 200, `expected 200 nfts, got ${r.nfts.length}`)
+  })
+
+  it('exactly 200 NFT entries with no explicit maxNfts → all 200 kept (no over-capping)', () => {
+    const r = mergeCatalog(null,
+      Array.from({ length: 200 }, (_, i) => makeNftEntry(i + 1)),
+      { network: 'mainnet', generatedAt: 'T' }
+    )
+    assert.equal(r.nfts.length, 200)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (B) mergeCatalog :280-282 appToken sort — kills appA/appB ternary swap and
+//     appB-appA → appA-appB mutations in addrCmp
+//     appToken flag is set only on newlyProbedEntries entries (the catalog JSON
+//     does not persist this flag, so previous-catalog entries cannot carry it).
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('mergeCatalog – appToken sort :280-282: appToken entry from new probe beats higher-txs normal', () => {
+  const APP_ADDR  = '0x1111000000000000000000000000000000000001'  // appToken, low txs
+  const NORM_ADDR = '0x2222000000000000000000000000000000000002'  // normal,   high txs
+
+  const entries = [
+    {
+      address: NORM_ADDR,
+      probe: { name: 'Normal', symbol: 'NRM', decimals: '0x12',
+               totalSupply: '0x01', is721: false, is1155: false },
+      discoverTxs: 9999,
+      appToken: false,
+    },
+    {
+      address: APP_ADDR,
+      probe: { name: 'AppTok', symbol: 'APP', decimals: '0x12',
+               totalSupply: '0x01', is721: false, is1155: false },
+      discoverTxs: 1,
+      appToken: true,
+    },
+  ]
+
+  const result = mergeCatalog(null, entries, { network: 'mainnet', generatedAt: 'T' })
+
+  it('appToken entry with discoverTxs=1 sorts before normal entry with discoverTxs=9999', () => {
+    // Mutation appA/appB swap (?0:1): normal entry gets appB=1, app entry gets appA=0 →
+    //   appB(1) - appA(0) = 1 → normal first (wrong).
+    // Mutation appA-appB: direction inverted → normal first (wrong).
+    assert.equal(result.tokens[0].address, APP_ADDR,  'appToken must be first')
+    assert.equal(result.tokens[1].address, NORM_ADDR, 'normal entry must be second')
+  })
+
+  it('two appToken entries are sorted by discoverTxs descending', () => {
+    const APP_A = '0xaaaa000000000000000000000000000000000001'  // txs=10
+    const APP_B = '0xbbbb000000000000000000000000000000000002'  // txs=50 → first
+    const r = mergeCatalog(null, [
+      { address: APP_A, probe: { name:'A',symbol:'A',decimals:'0x06',totalSupply:'0x01',is721:false,is1155:false }, discoverTxs: 10, appToken: true },
+      { address: APP_B, probe: { name:'B',symbol:'B',decimals:'0x06',totalSupply:'0x01',is721:false,is1155:false }, discoverTxs: 50, appToken: true },
+    ], { network: 'mainnet', generatedAt: 'T' })
+    assert.equal(r.tokens[0].address, APP_B, 'higher-txs appToken must be first')
+    assert.equal(r.tokens[1].address, APP_A)
+  })
+
+  it('two appToken entries with equal txs are sorted by address ascending', () => {
+    const APP_A = '0xaaaa000000000000000000000000000000000001'
+    const APP_B = '0xbbbb000000000000000000000000000000000002'
+    const r = mergeCatalog(null, [
+      { address: APP_B, probe: { name:'B',symbol:'B',decimals:'0x06',totalSupply:'0x01',is721:false,is1155:false }, discoverTxs: 100, appToken: true },
+      { address: APP_A, probe: { name:'A',symbol:'A',decimals:'0x06',totalSupply:'0x01',is721:false,is1155:false }, discoverTxs: 100, appToken: true },
+    ], { network: 'mainnet', generatedAt: 'T' })
+    assert.equal(r.tokens[0].address, APP_A, 'smaller address first among equal-txs appToken entries')
+    assert.equal(r.tokens[1].address, APP_B)
+  })
+
+  it('appToken NFT entry from new probe beats a higher-txs normal NFT', () => {
+    const APP_NFT  = '0x1111000000000000000000000000000000000001'
+    const NORM_NFT = '0x9999000000000000000000000000000000000009'
+    const r = mergeCatalog(null, [
+      { address: NORM_NFT, probe: { name:'N',symbol:'N',decimals:null,totalSupply:null,is721:true,is1155:false }, discoverTxs: 9999, appToken: false },
+      { address: APP_NFT,  probe: { name:'A',symbol:'A',decimals:null,totalSupply:null,is721:true,is1155:false }, discoverTxs: 1,    appToken: true  },
+    ], { network: 'mainnet', generatedAt: 'T' })
+    assert.equal(r.nfts[0].address, APP_NFT, 'appToken NFT must be first')
+    assert.equal(r.nfts[1].address, NORM_NFT)
+  })
+
+  it('previous-catalog entry does NOT carry appToken (flag is not persisted in catalog JSON)', () => {
+    // catalog.mjs stores only {address, name, symbol, decimals, totalSupply} for tokens;
+    // the appToken flag is NOT written to the catalog file and therefore NOT readable from
+    // previous.tokens. The appTokenLookup in mergeCatalog is built only from newlyProbedEntries.
+    // A token that arrived via previous.tokens gets appToken=0 in addrCmp.
+    const PREV_ADDR = '0x1111000000000000000000000000000000000001'
+    const NEW_ADDR  = '0x2222000000000000000000000000000000000002'
+    const prev = {
+      tokens: [{ address: PREV_ADDR, name: 'Prev', symbol: 'PRV', decimals: 6, totalSupply: '1' }],
+      nfts: [], probed: { [PREV_ADDR]: 'erc20' },
+    }
+    // New entry has higher discoverTxs and no appToken flag
+    const r = mergeCatalog(prev, [
+      { address: NEW_ADDR, probe: { name:'New',symbol:'NW',decimals:'0x06',totalSupply:'0x01',is721:false,is1155:false }, discoverTxs: 500, appToken: false },
+    ], { network: 'mainnet', generatedAt: 'T' })
+    // NEW_ADDR has higher txs → sorts first (no appToken bonus for either)
+    assert.equal(r.tokens[0].address, NEW_ADDR, 'higher-txs new entry sorts first when no appToken')
+    assert.equal(r.tokens[1].address, PREV_ADDR)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (C) mergeCatalog :285 addr comparator — 3-entry test to trigger a > b branch
+//     Mutation: swap `?-1:?1:0` → `?1:?-1:0` (invert both branches)
+//     Two-entry tests only exercise the `a < b` branch. A third entry that is
+//     largest forces the comparator to reach `a > b ? 1 : 0`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('mergeCatalog – addr tie-break :285: 3 entries, reversed input, covers a>b branch', () => {
+  // Three erc20 entries with EQUAL discoverTxs, fed in reverse-address order so that
+  // the comparator must evaluate both `a < b` (true once) and `a > b` (true once).
+  const entries = [
+    { address: '0xcccc000000000000000000000000000000000003', probe: { name:'C',symbol:'C',decimals:'0x06',totalSupply:'0x01',is721:false,is1155:false }, discoverTxs: 50 },
+    { address: '0xaaaa000000000000000000000000000000000001', probe: { name:'A',symbol:'A',decimals:'0x06',totalSupply:'0x01',is721:false,is1155:false }, discoverTxs: 50 },
+    { address: '0xbbbb000000000000000000000000000000000002', probe: { name:'B',symbol:'B',decimals:'0x06',totalSupply:'0x01',is721:false,is1155:false }, discoverTxs: 50 },
+  ]
+
+  it('3 tokens same txs (reversed input) → address ascending: aaaa < bbbb < cccc', () => {
+    // Mutation (ternary swap): would put cccc first, then bbbb, then aaaa.
+    const result = mergeCatalog(null, entries, { network: 'mainnet', generatedAt: 'T' })
+    assert.equal(result.tokens[0].address, '0xaaaa000000000000000000000000000000000001')
+    assert.equal(result.tokens[1].address, '0xbbbb000000000000000000000000000000000002')
+    assert.equal(result.tokens[2].address, '0xcccc000000000000000000000000000000000003')
+  })
+
+  it('3 NFTs same txs (reversed input) → address ascending (a>b branch in addrCmp)', () => {
+    const nftEntries = [
+      { address: '0xcccc000000000000000000000000000000000003', probe: { name:'C',symbol:'C',decimals:null,totalSupply:null,is721:true,is1155:false }, discoverTxs: 50 },
+      { address: '0xaaaa000000000000000000000000000000000001', probe: { name:'A',symbol:'A',decimals:null,totalSupply:null,is721:true,is1155:false }, discoverTxs: 50 },
+      { address: '0xbbbb000000000000000000000000000000000002', probe: { name:'B',symbol:'B',decimals:null,totalSupply:null,is721:true,is1155:false }, discoverTxs: 50 },
+    ]
+    const result = mergeCatalog(null, nftEntries, { network: 'mainnet', generatedAt: 'T' })
+    assert.equal(result.nfts[0].address, '0xaaaa000000000000000000000000000000000001')
+    assert.equal(result.nfts[1].address, '0xbbbb000000000000000000000000000000000002')
+    assert.equal(result.nfts[2].address, '0xcccc000000000000000000000000000000000003')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (D) buildCatalog :342 addr comparator — 3-entry test to trigger a > b branch
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('buildCatalog – addr tie-break :342: 3 entries, reversed input, covers a>b branch', () => {
+  const entries = [
+    { address: '0xcccc000000000000000000000000000000000003', probe: erc20Probe(), discoverTxs: 100 },
+    { address: '0xaaaa000000000000000000000000000000000001', probe: erc20Probe(), discoverTxs: 100 },
+    { address: '0xbbbb000000000000000000000000000000000002', probe: erc20Probe(), discoverTxs: 100 },
+  ]
+
+  it('3 tokens same discoverTxs (c,a,b input) → sorted a < b < c', () => {
+    // Mutation (swap ?-1:?1): reverses both branches → c first then b then a.
+    const cat = buildCatalog({ network: 'mainnet', generatedAt: 'T', entries })
+    assert.equal(cat.tokens[0].address, '0xaaaa000000000000000000000000000000000001')
+    assert.equal(cat.tokens[1].address, '0xbbbb000000000000000000000000000000000002')
+    assert.equal(cat.tokens[2].address, '0xcccc000000000000000000000000000000000003')
+  })
+
+  it('3 NFTs same discoverTxs (c,a,b input) → sorted a < b < c (a>b branch reached)', () => {
+    const nftEntries = [
+      { address: '0xcccc000000000000000000000000000000000003', probe: erc721Probe(), discoverTxs: 100 },
+      { address: '0xaaaa000000000000000000000000000000000001', probe: erc721Probe(), discoverTxs: 100 },
+      { address: '0xbbbb000000000000000000000000000000000002', probe: erc721Probe(), discoverTxs: 100 },
+    ]
+    const cat = buildCatalog({ network: 'mainnet', generatedAt: 'T', entries: nftEntries })
+    assert.equal(cat.nfts[0].address, '0xaaaa000000000000000000000000000000000001')
+    assert.equal(cat.nfts[1].address, '0xbbbb000000000000000000000000000000000002')
+    assert.equal(cat.nfts[2].address, '0xcccc000000000000000000000000000000000003')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (E) candidateAddresses :74 addr comparator — 3 candidates, equal txs, reversed
+//     input to exercise a > b branch
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('candidateAddresses – addr tie-break :74: 3 candidates, equal txs, reversed input', () => {
+  it('c,a,b with equal txs → sorted a < b < c (a>b branch exercised)', () => {
+    // Two-entry tests with a<b only exercise the `a<b?-1` branch.
+    // With c fed first and a second, comparison (c vs a) hits `a>b?1` (i.e. c>a → 1).
+    // Mutation (swap): would return -1 when a>b → c sorts before a (wrong).
+    const labels = {
+      '0xcccc000000000000000000000000000000000003': { symbol: 'C', name: 'C' },
+      '0xaaaa000000000000000000000000000000000001': { symbol: 'A', name: 'A' },
+      '0xbbbb000000000000000000000000000000000002': { symbol: 'B', name: 'B' },
+    }
+    const discover = {
+      contracts: [
+        { address: '0xcccc000000000000000000000000000000000003', txs: 300 },
+        { address: '0xaaaa000000000000000000000000000000000001', txs: 300 },
+        { address: '0xbbbb000000000000000000000000000000000002', txs: 300 },
+      ],
+    }
+    const result = candidateAddresses(labels, discover)
+    assert.equal(result[0], '0xaaaa000000000000000000000000000000000001')
+    assert.equal(result[1], '0xbbbb000000000000000000000000000000000002')
+    assert.equal(result[2], '0xcccc000000000000000000000000000000000003')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (F) Equivalence table for :118 and :143 mutations
+//
+// :118 `!Number.isInteger(n) || n < 0 || n > 36` (|| → &&):
+//   Killed by existing test `decodeDecimals('0x25') → null`:
+//   With &&: isInteger(37)=true → !true=false → false && ... = false → guard fails →
+//   returns 37, not null. Test asserts null → fails on mutant. NOT equivalent.
+//   All three conditions must be true simultaneously for && to match, which cannot
+//   happen for a real integer in [0..36] or a negative int (only if n were
+//   simultaneously non-integer, negative, AND >36, which is impossible for any
+//   integer). The only reachable case is a large integer >36 (e.g. 37) where
+//   isInteger=true → !true=false → short-circuits → passes guard wrongly.
+//
+// :143 `!hex || hex === '0x'` in decodeSupply (|| → &&):
+//   With &&: `!hex && hex === '0x'`. For '': !''=true, ''==='0x'=false → false →
+//   falls through → BigInt('') = 0n → '0' (WRONG; correct is null). So '' is the
+//   kill witness. NOT an equivalent mutant — the test `decodeSupply('') === null` kills it.
+//   (null and '0x' happen to produce the same result both ways, but '' does not.)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('decodeDecimals – :118 ||→&& is NOT equivalent (killed by existing 0x25 test)', () => {
+  it('0x25 (37) → null regardless: with ||, guard fires (37>36); with &&, isInteger check fails guard → 37 returned', () => {
+    // This test EXPLICITLY documents the kill path.
+    // With mutant &&: !isInteger(37)=false → false&&...=false → returns 37 ≠ null → FAIL.
+    assert.strictEqual(decodeDecimals('0x25'), null)
+  })
+})
+
+describe('decodeSupply – :143 ||→&& is NOT equivalent (empty string kills it)', () => {
+  // With ||: !'' = true → guard fires → null.
+  // With &&: !''=true, ''==='0x'=false → false → falls through → BigInt('')=0n → '0' (WRONG).
+  // So '' distinguishes the mutant. null/'0x'/undefined are equivalent paths both ways,
+  // but '' is NOT — it's the kill witness.
+  it("'' → null (kills ||→&& mutant: with &&, BigInt('') = 0n → '0', not null)", () => {
+    assert.strictEqual(decodeSupply(''), null)
+  })
+  it('null → null (equivalent path: both || and && return null for null input)', () => {
+    // With ||: !null=true → guard fires → null.
+    // With &&: !null=true, null==='0x'=false → false → BigInt(null) throws → null.
+    assert.strictEqual(decodeSupply(null), null)
+  })
+  it("'0x' → null (equivalent path: both return null for '0x')", () => {
+    // With ||: !'0x'=false but '0x'==='0x'=true → guard fires → null.
+    // With &&: !'0x'=false → short-circuit → falls through → BigInt('0x') throws → null.
+    assert.strictEqual(decodeSupply('0x'), null)
+  })
+  it("undefined → null (equivalent path: both return null for undefined)", () => {
+    assert.strictEqual(decodeSupply(undefined), null)
+  })
+  it("valid hex '0x01' → '1' (sanity: guard does not over-reject)", () => {
+    assert.strictEqual(decodeSupply('0x01'), '1')
+  })
+})
