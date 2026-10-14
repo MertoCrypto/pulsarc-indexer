@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { KNOWN, decodeString } from '../src/labelCore.mjs';
+import { KNOWN, decodeString, cleanName } from '../src/labelCore.mjs';
 
 // ---------------------------------------------------------------------------
 // ABI-encoding helper
@@ -234,13 +234,11 @@ describe('decodeString – trims surrounding spaces', () => {
     assert.equal(decodeString(abiEncodeString('  USD Coin  ')), 'USD Coin');
   });
 
-  it('string that is only spaces (length <= 80) trims to empty -> documents current behaviour', () => {
-    // "   " passes the regex (spaces are in range) and len <= 80
-    // trim() produces "" but the return is ""; it's a non-null empty string
+  it('string that is only spaces -> null (cleanName strips to empty)', () => {
+    // "   " passes the printable-range regex, but cleanName collapses + trims
+    // to "" and returns null. decodeString therefore returns null.
     const hex = abiEncodeString('   ');
-    const result = decodeString(hex);
-    // Current behaviour: returns '' (the trimmed result) — not null
-    assert.equal(result, '');
+    assert.equal(decodeString(hex), null);
   });
 });
 
@@ -442,5 +440,250 @@ describe('decodeString – exact output assertions', () => {
 
   it('decodes "  USD Coin  " to exactly "USD Coin" (trim)', () => {
     assert.equal(decodeString(abiEncodeString('  USD Coin  ')), 'USD Coin');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cleanName — type guard
+// ---------------------------------------------------------------------------
+
+describe('cleanName – non-string inputs', () => {
+  it('null -> null', () => {
+    assert.equal(cleanName(null), null);
+  });
+
+  it('undefined -> null', () => {
+    assert.equal(cleanName(undefined), null);
+  });
+
+  it('number -> null', () => {
+    assert.equal(cleanName(42), null);
+  });
+
+  it('object -> null', () => {
+    assert.equal(cleanName({}), null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cleanName — RIGHT-TO-LEFT OVERRIDE (U+202E) attack
+// ---------------------------------------------------------------------------
+
+describe('cleanName – RTL override / direction spoofing', () => {
+  it('"\\u202EcdsU" (RTL override before "cdsU") -> "cdsU"', () => {
+    // This is the exact attack vector: renders as "USDC" in RTL renderers.
+    assert.equal(cleanName('\u202EcdsU'), 'cdsU');
+  });
+
+  it('RTL override embedded mid-string is stripped', () => {
+    assert.equal(cleanName('US\u202EDC'), 'USDC');
+  });
+
+  it('ABI-encoded "\\u202EcdsU" -> "cdsU" through decodeString', () => {
+    // U+202E is 3 bytes in UTF-8 (E2 80 AE); "cdsU" is 4 bytes -> total 7 bytes, within 80.
+    // U+202E is in \u00a0-\ufffd range so it passes the printable-range regex.
+    // cleanName must strip it.
+    assert.equal(decodeString(abiEncodeString('\u202EcdsU')), 'cdsU');
+  });
+
+  it('LTR embedding U+202A stripped', () => {
+    assert.equal(cleanName('\u202AHello'), 'Hello');
+  });
+
+  it('LTR/RTL isolate U+2066/U+2067 stripped', () => {
+    assert.equal(cleanName('\u2066Token\u2067'), 'Token');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cleanName — zero-width / invisible characters
+// ---------------------------------------------------------------------------
+
+describe('cleanName – zero-width and invisible characters', () => {
+  it('"A\\u200BB" (zero-width space between A and B) -> "AB"', () => {
+    assert.equal(cleanName('A\u200BB'), 'AB');
+  });
+
+  it('ABI-encoded "A\\u200BB" -> "AB" through decodeString', () => {
+    assert.equal(decodeString(abiEncodeString('A\u200BB')), 'AB');
+  });
+
+  it('zero-width non-joiner U+200C stripped', () => {
+    assert.equal(cleanName('AB\u200CCD'), 'ABCD');
+  });
+
+  it('zero-width joiner U+200D stripped', () => {
+    assert.equal(cleanName('AB\u200DCD'), 'ABCD');
+  });
+
+  it('BOM U+FEFF stripped', () => {
+    assert.equal(cleanName('\uFEFFToken'), 'Token');
+  });
+
+  it('soft hyphen U+00AD stripped', () => {
+    assert.equal(cleanName('To\u00ADken'), 'Token');
+  });
+
+  it('Arabic letter mark U+061C stripped', () => {
+    assert.equal(cleanName('USDC\u061C'), 'USDC');
+  });
+
+  it('word joiner U+2060 stripped', () => {
+    assert.equal(cleanName('USD\u2060C'), 'USDC');
+  });
+
+  it('function application U+2061 stripped', () => {
+    assert.equal(cleanName('USD\u2061C'), 'USDC');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cleanName — C0 / C1 control characters
+// ---------------------------------------------------------------------------
+
+describe('cleanName – C0/C1 control characters', () => {
+  it('null byte U+0000 stripped', () => {
+    assert.equal(cleanName('AB\u0000CD'), 'ABCD');
+  });
+
+  it('unit separator U+001F stripped', () => {
+    assert.equal(cleanName('AB\u001FCD'), 'ABCD');
+  });
+
+  it('DEL U+007F stripped', () => {
+    assert.equal(cleanName('AB\u007FCD'), 'ABCD');
+  });
+
+  it('C1 control U+009F stripped', () => {
+    assert.equal(cleanName('AB\u009FCD'), 'ABCD');
+  });
+
+  it('C1 control U+0080 stripped', () => {
+    assert.equal(cleanName('AB\u0080CD'), 'ABCD');
+  });
+
+  it('only C0/C1 controls -> null', () => {
+    assert.equal(cleanName('\u0001\u0002\u007f\u009f'), null);
+  });
+
+  it('ABI-encoded string of only invisible chars -> null through decodeString', () => {
+    // U+200B is in the printable-range regex (\u00a0-\ufffd), passes regex,
+    // but cleanName strips it, leaving empty -> null.
+    const onlyInvisible = '\u200B\u200C\u200D\u200E\u200F';
+    assert.equal(decodeString(abiEncodeString(onlyInvisible)), null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cleanName — consecutive whitespace collapsed
+// ---------------------------------------------------------------------------
+
+describe('cleanName – whitespace collapsing', () => {
+  it('multiple internal spaces collapsed to one', () => {
+    assert.equal(cleanName('USD  Coin'), 'USD Coin');
+  });
+
+  it('tabs and spaces mixed -> single space', () => {
+    assert.equal(cleanName('USD\t Coin'), 'USD Coin');
+  });
+
+  it('only whitespace -> null', () => {
+    assert.equal(cleanName('   '), null);
+  });
+
+  it('only whitespace after stripping invisible chars -> null', () => {
+    assert.equal(cleanName('\u200B  \u200C'), null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cleanName — emoji and international characters preserved
+// ---------------------------------------------------------------------------
+
+describe('cleanName – emoji and international characters preserved', () => {
+  it('emoji preserved', () => {
+    assert.equal(cleanName('Token\uD83D\uDE80'), 'Token\uD83D\uDE80'); // 🚀
+  });
+
+  it('Turkish ç, ğ, İ preserved', () => {
+    assert.equal(cleanName('Türkçe Adı İçin'), 'Türkçe Adı İçin');
+  });
+
+  it('ABI-encoded Turkish string preserved through decodeString', () => {
+    // ç=U+00E7, ğ=U+011F, İ=U+0130 — all safe, none in STRIP_RE
+    const s = 'Çekirdek';
+    assert.equal(decodeString(abiEncodeString(s)), s);
+  });
+
+  it('CJK characters preserved', () => {
+    assert.equal(cleanName('代币'), '代币');
+  });
+
+  it('Arabic letters (not Arabic letter mark) preserved', () => {
+    // U+0639 is Arabic letter ain — not U+061C (Arabic letter mark, which IS stripped)
+    assert.equal(cleanName('\u0639\u0631\u0628\u064a'), '\u0639\u0631\u0628\u064a');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cleanName — 80 code-point limit (surrogate-pair-aware)
+// ---------------------------------------------------------------------------
+
+describe('cleanName – 80 code-point limit', () => {
+  it('exactly 80 ASCII chars -> returned unchanged', () => {
+    const s = 'A'.repeat(80);
+    assert.equal(cleanName(s), s);
+  });
+
+  it('81 ASCII chars -> truncated to 80', () => {
+    const s = 'A'.repeat(81);
+    const result = cleanName(s);
+    assert.equal(result, 'A'.repeat(80));
+  });
+
+  it('80 code points with emoji (surrogate pairs) -> not split', () => {
+    // rocket = U+1F680, encoded as surrogate pair \uD83D\uDE80 (2 JS chars, 1 code point)
+    // 79 'A' chars + 1 rocket = 80 code points
+    const rocket = '\uD83D\uDE80';
+    const s = 'A'.repeat(79) + rocket;
+    const result = cleanName(s);
+    // 80 code points -> no truncation -> rocket preserved intact
+    assert.equal(result, s);
+    assert.equal([...result].length, 80);
+  });
+
+  it('81 code points with emoji at position 80 -> surrogate pair NOT split', () => {
+    // 80 'A' chars + 1 rocket = 81 code points -> truncate to 80 -> rocket excluded
+    const rocket = '\uD83D\uDE80';
+    const s = 'A'.repeat(80) + rocket;
+    const result = cleanName(s);
+    assert.equal(result, 'A'.repeat(80));
+    assert.equal([...result].length, 80);
+    // Confirm no lone surrogate
+    assert.ok(!result.includes('\uD83D') && !result.includes('\uDE80'));
+  });
+
+  it('decodeString 80-char limit preserved after cleanName', () => {
+    // 80 'x' chars -> ABI byte len = 80 -> passes len guard -> cleanName -> 80 chars -> returned
+    const s = 'x'.repeat(80);
+    assert.equal(decodeString(abiEncodeString(s)), s);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cleanName — empty string
+// ---------------------------------------------------------------------------
+
+describe('cleanName – empty result -> null', () => {
+  it('empty string -> null', () => {
+    assert.equal(cleanName(''), null);
+  });
+
+  it('string of only STRIP_RE chars -> null', () => {
+    assert.equal(cleanName('\u200B\u200C\u200D\uFEFF\u00AD'), null);
+  });
+
+  it('string of only RTL overrides -> null', () => {
+    assert.equal(cleanName('\u202A\u202B\u202C\u202D\u202E'), null);
   });
 });

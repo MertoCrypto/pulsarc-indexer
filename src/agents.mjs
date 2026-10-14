@@ -38,7 +38,8 @@ export function decodeString(hex) {
   } catch { return null }
 }
 
-const clean = (v, n) => (typeof v === 'string' ? v.replace(/[\u0000-\u001f\u007f\s]+/g, ' ').trim().slice(0, n) : undefined) || undefined
+// Invisible and direction-changing characters are dropped (they can disguise a name); other control characters and runs of whitespace become one space.
+const clean = (v, n) => (typeof v === 'string' ? v.replace(/[\u00ad\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g, '').replace(/[\u0000-\u001f\u007f-\u009f\s]+/g, ' ').trim().slice(0, n) : undefined) || undefined
 
 /**
  * Keep the stored record small. Inline `data:application/json;base64,` profiles are decoded here
