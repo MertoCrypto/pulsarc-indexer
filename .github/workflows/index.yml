@@ -38,7 +38,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID }}
           NOTIFY_NETS: mainnet
-          NOTIFY_KINDS: anomaly
+          NOTIFY_KINDS: anomaly,weekly
           # Wallet index on mainnet stays off until the repository variable WALLET_INDEX_MAINNET is set to 1.
           WALLET_INDEX: ${{ vars.WALLET_INDEX_MAINNET }}
         run: NET=mainnet BUDGET_SECONDS=1200 node src/run.mjs && NET=mainnet node src/summarize.mjs && NET=mainnet node src/supply.mjs && (NET=mainnet node src/balances.mjs || echo "balances failed") && (NET=mainnet node src/agents-activity.mjs || echo "agents-activity failed") && NET=mainnet node src/label.mjs && NET=mainnet node src/extras.mjs
