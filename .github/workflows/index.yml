@@ -51,6 +51,12 @@ jobs:
         continue-on-error: true
         run: NET=mainnet node src/catalog.mjs
 
+      # Token logos from DexScreener (data/mainnet/logos.json), keyed by address. Needs catalog.json; a failure never blocks publishing.
+      - name: Token logos (mainnet)
+        if: ${{ vars.CATALOG_MAINNET == '1' }}
+        continue-on-error: true
+        run: NET=mainnet node src/dexLogos.mjs
+
       - name: Index Arc Testnet
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
