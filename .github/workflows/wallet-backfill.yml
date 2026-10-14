@@ -8,6 +8,8 @@ on:
     inputs:
       net:
         description: 'mainnet or testnet'
+        type: choice
+        options: [mainnet, testnet]
         default: 'mainnet'
       from_block:
         description: 'first block to scan (0 = from genesis)'
@@ -37,5 +39,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FROM_BLOCK: ${{ inputs.from_block }}
+          NET_INPUT: ${{ inputs.net }}   # passed through env, never pasted into the shell line
           NODE_OPTIONS: --max-old-space-size=5120   # the runner has 7 GB; the default heap ran out on a busy day
-        run: ./scripts/backfill-wallets.sh "${{ inputs.net }}"
+        run: |
+          case "$NET_INPUT" in mainnet|testnet) ;; *) echo "net must be mainnet or testnet"; exit 1 ;; esac
+          case "$FROM_BLOCK" in ''|*[!0-9]*) echo "from_block must be a whole number"; exit 1 ;; esac
+          ./scripts/backfill-wallets.sh "$NET_INPUT"

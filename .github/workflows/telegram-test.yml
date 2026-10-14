@@ -3,6 +3,9 @@ name: telegram-test
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read   # only sends one Telegram message; needs no repository write access
+
 jobs:
   ping:
     runs-on: ubuntu-latest
