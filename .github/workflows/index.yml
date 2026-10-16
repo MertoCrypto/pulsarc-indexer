@@ -59,9 +59,8 @@ jobs:
 
       - name: Index Arc Testnet
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID }}
-          NOTIFY_NETS: testnet
+          # No Telegram credentials here on purpose: testnet never posts to Telegram.
+          # (The feed.xml and notified.json state are still written.)
           NOTIFY_KINDS: anomaly,daily,health,rank,contract,agents,weekly
           WALLET_INDEX: '1'
         run: NET=testnet BUDGET_SECONDS=300 BACKFILL_HOURS=24 node src/run.mjs && NET=testnet node src/summarize.mjs && NET=testnet node src/supply.mjs && (NET=testnet node src/balances.mjs || echo "balances failed") && (NET=testnet node src/agents-activity.mjs || echo "agents-activity failed") && (NET=testnet node src/fx.mjs || echo "fx failed") && NET=testnet node src/label.mjs && NET=testnet node src/extras.mjs
