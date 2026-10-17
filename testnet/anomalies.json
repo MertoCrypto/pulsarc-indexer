@@ -1,0 +1,1 @@
+{"network":"testnet","generatedAt":"2026-10-17T16:47:36.743Z","items":[{"app":"wusdc","kind":"spike","ratio":99,"txs":1401,"baseline":0},{"app":"usyc","kind":"spike","ratio":99,"txs":763,"baseline":0},{"app":"eurc","kind":"spike","ratio":6.1,"txs":1783,"baseline":294},{"app":"usdc","kind":"spike","ratio":2.7,"txs":8158,"baseline":2988}],"status":"ok","hour":"2026-10-17T15"}
