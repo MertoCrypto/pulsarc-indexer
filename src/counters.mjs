@@ -92,6 +92,15 @@ export const DEPOSIT_FOR_BURN_TOPIC = '0x0c8c1cbdc5190613ebd485511d4e2812cfa45ee
 export const MESSAGE_RECEIVED_TOPIC = '0xff48c13eda96b1cceacc6b9edeedc9e9db9d6226afbc30146b720c19d3addb1c'
 
 /**
+ * Topic0 for CCTP v2 TokenMessenger MintAndWithdraw(address indexed mintRecipient, uint256 amount,
+ * address indexed mintToken, uint256 feeCollected).
+ * = keccak256("MintAndWithdraw(address,uint256,address,uint256)")
+ * VERIFIED: confirmed from Arc Mainnet inbound receipt (logIndex 0x8 in
+ * 0xef0b4c5631df763e79c2160ec7f590c16e32754ba362ccc8f76f0c8921c5ba89).
+ */
+export const MINT_AND_WITHDRAW_TOPIC = '0x50c55e915134d457debfa58eb6f4342956f8b0616d51a89a3659360178e1ab63'
+
+/**
  * Big-transfer threshold in USDC. Transfers >= this value are tracked individually.
  */
 export const BIG_TRANSFER_USDC = 5_000_000
@@ -251,6 +260,190 @@ export function decodeMessageReceived(data) {
     const sourceDomain = Number(BigInt('0x' + raw.slice(0, 64)))
     return { sourceDomain }
   } catch { return null }
+}
+
+/**
+ * Decode a MintAndWithdraw log from TOKEN_MESSENGER_V2.
+ * Non-indexed fields in data: amount(uint256) word 0, feeCollected(uint256) word 1.
+ * (mintRecipient and mintToken are indexed topics, not in data.)
+ *
+ * Returns { amount, fee } or null on parse error / short data.
+ * amount = toFixed(2), fee = toFixed(6) — same style as decodeDepositForBurn.
+ *
+ * @param {string} data      Log data hex string
+ * @param {number} decimals  USDC decimals
+ * @returns {{ amount: number, fee: number } | null}
+ */
+export function decodeMintAndWithdraw(data, decimals) {
+  try {
+    const raw = data.startsWith('0x') ? data.slice(2) : data
+    if (raw.length < 2 * 64) return null  // need words 0 (amount) and 1 (feeCollected)
+    const word  = (i) => BigInt('0x' + raw.slice(i * 64, (i + 1) * 64))
+    const amount = Number(word(0)) / 10 ** decimals
+    const fee    = Number(word(1)) / 10 ** decimals
+    return { amount: +amount.toFixed(2), fee: +fee.toFixed(6) }
+  } catch { return null }
+}
+
+/**
+ * Scan a single receipt's logs and return all USDC inbound CCTP mints paired with their
+ * source domain.  Each item in the returned array corresponds to one MintAndWithdraw log
+ * whose mintToken matches the USDC address (case-insensitive) and whose emitting contract
+ * is the tokenMessenger address (case-insensitive).
+ *
+ * Pairing strategy: for each qualifying MintAndWithdraw log, look for the FIRST
+ * MessageReceived log (from messageTransmitter, appearing AFTER the MintAndWithdraw)
+ * that has not already been consumed.  If found, attach its sourceDomain; otherwise
+ * domain is null (the MessageReceived was absent or already consumed).
+ *
+ * Returns an empty array when the receipt has no qualifying USDC MintAndWithdraw logs.
+ * A MessageReceived with no matching MintAndWithdraw (e.g. non-USDC message) is silently
+ * ignored — the existing in[0] counter in run.mjs continues to count all MessageReceived
+ * events unchanged.
+ *
+ * @param {object[]} logs
+ * @param {{ tokenMessenger: string, messageTransmitter: string, usdc: string, decimals: number }} opts
+ * @returns {{ usdc: number, fee: number, domain: number|null }[]}
+ */
+export function bridgeInsFromReceipt(logs, { tokenMessenger, messageTransmitter, usdc, decimals }) {
+  const tmLc  = tokenMessenger.toLowerCase()
+  const mtLc  = messageTransmitter.toLowerCase()
+  const usdcLc = usdc.toLowerCase()
+
+  // First pass: collect MintAndWithdraw entries (USDC only) with their log index position
+  const mints = []
+  for (let i = 0; i < logs.length; i++) {
+    const log = logs[i]
+    if (!log.topics?.length) continue
+    if (log.address?.toLowerCase() !== tmLc) continue
+    if (log.topics[0].toLowerCase() !== MINT_AND_WITHDRAW_TOPIC) continue
+    // topics[2] = mintToken (padded address); last 40 hex chars = address
+    if (!log.topics[2]) continue
+    const mintToken = ('0x' + log.topics[2].slice(-40)).toLowerCase()
+    if (mintToken !== usdcLc) continue
+    const decoded = decodeMintAndWithdraw(log.data, decimals)
+    if (!decoded) continue
+    mints.push({ logIdx: i, usdc: decoded.amount, fee: decoded.fee })
+  }
+
+  if (mints.length === 0) return []
+
+  // Second pass: build an ordered list of MessageReceived log positions
+  const mrPositions = []
+  for (let i = 0; i < logs.length; i++) {
+    const log = logs[i]
+    if (!log.topics?.length) continue
+    if (log.address?.toLowerCase() !== mtLc) continue
+    if (log.topics[0].toLowerCase() !== MESSAGE_RECEIVED_TOPIC) continue
+    const decoded = decodeMessageReceived(log.data)
+    mrPositions.push({ logIdx: i, sourceDomain: decoded?.sourceDomain ?? null })
+  }
+
+  // Pair each mint with the first unconsumed MessageReceived that appears after it
+  const usedMr = new Set()
+  const result = []
+  for (const mint of mints) {
+    let paired = null
+    for (let j = 0; j < mrPositions.length; j++) {
+      if (usedMr.has(j)) continue
+      if (mrPositions[j].logIdx > mint.logIdx) {
+        paired = mrPositions[j]
+        usedMr.add(j)
+        break
+      }
+    }
+    // If no MessageReceived found after, also try any unconsumed one (before) for robustness
+    if (!paired) {
+      for (let j = 0; j < mrPositions.length; j++) {
+        if (usedMr.has(j)) continue
+        paired = mrPositions[j]
+        usedMr.add(j)
+        break
+      }
+    }
+    result.push({
+      usdc:   mint.usdc,
+      fee:    mint.fee,
+      domain: paired ? paired.sourceDomain : null,
+    })
+  }
+  return result
+}
+
+// ── T3b Part 5b: accumulateBridge ────────────────────────────────────────────
+
+/**
+ * Accumulate CCTP bridge events from a single receipt's logs into the hour
+ * accumulator `h._bridge`.  Mutates `h` in place; creates `h._bridge` when
+ * absent.  Tolerates an old restored `_bridge` shape with `in:[n]` and no
+ * `byDomainIn` key.
+ *
+ * Logic is identical to the inline bridge block in run.mjs apply():
+ *   - DepositForBurn from tokenMessenger  → out[0]++, out[1]+=amount, out[2]+=maxFee,
+ *                                           byDomain[domain]++/+=amount (20-domain cap)
+ *   - MessageReceived from messageTransmitter → in[0]++
+ *   - bridgeInsFromReceipt (MintAndWithdraw) → in[1]+=usdc, in[2]+=fee,
+ *                                               byDomainIn[domain]++/+=usdc (20-domain cap)
+ *
+ * @param {object}   h       Hour accumulator (mutated in place)
+ * @param {object[]} logs    Receipt logs array
+ * @param {{ tokenMessenger: string, messageTransmitter: string, usdc: string, decimals: number }} opts
+ */
+export function accumulateBridge(h, logs, { tokenMessenger, messageTransmitter, usdc, decimals }) {
+  const tmLc = tokenMessenger.toLowerCase()
+  const mtLc = messageTransmitter.toLowerCase()
+
+  for (const log of logs ?? []) {
+    if (!log.topics?.length) continue
+
+    // Outgoing: DepositForBurn from TokenMessenger
+    if (log.address?.toLowerCase() === tmLc &&
+        log.topics[0].toLowerCase() === DEPOSIT_FOR_BURN_TOPIC) {
+      const decoded = decodeDepositForBurn(log.data, decimals)
+      if (decoded) {
+        const br = h._bridge ?? (h._bridge = { out: [0, 0, 0], in: [0, 0, 0], byDomain: {}, byDomainIn: {} })
+        br.out[0]++
+        br.out[1] = +(br.out[1] + decoded.amount).toFixed(2)
+        br.out[2] = +(br.out[2] + decoded.maxFee).toFixed(6)
+        const dk = String(decoded.domain)
+        br.byDomain[dk] ??= [0, 0]
+        br.byDomain[dk][0]++
+        br.byDomain[dk][1] = +(br.byDomain[dk][1] + decoded.amount).toFixed(2)
+        // Keep at most 20 domains
+        const domKeys = Object.keys(br.byDomain)
+        if (domKeys.length > 20) {
+          const oldest = domKeys[0]; delete br.byDomain[oldest]
+        }
+      }
+    }
+
+    // Incoming count: MessageReceived from MessageTransmitter (in[0] only, for backwards compat)
+    if (log.address?.toLowerCase() === mtLc &&
+        log.topics[0].toLowerCase() === MESSAGE_RECEIVED_TOPIC) {
+      const br = h._bridge ?? (h._bridge = { out: [0, 0, 0], in: [0, 0, 0], byDomain: {}, byDomainIn: {} })
+      br.in[0]++
+    }
+  }
+
+  // Incoming USDC amounts and source domains via MintAndWithdraw pairing
+  const brIns = bridgeInsFromReceipt(logs ?? [], { tokenMessenger, messageTransmitter, usdc, decimals })
+  for (const item of brIns) {
+    const br = h._bridge ?? (h._bridge = { out: [0, 0, 0], in: [0, 0, 0], byDomain: {}, byDomainIn: {} })
+    // Ensure in array is at least length 3 (tolerate old in:[n] shape loaded from open.json)
+    while (br.in.length < 3) br.in.push(0)
+    br.in[1] = +(((br.in[1] ?? 0) + item.usdc)).toFixed(2)
+    br.in[2] = +(((br.in[2] ?? 0) + item.fee)).toFixed(6)
+    const dk = String(item.domain ?? -1)
+    br.byDomainIn ??= {}
+    br.byDomainIn[dk] ??= [0, 0]
+    br.byDomainIn[dk][0]++
+    br.byDomainIn[dk][1] = +(br.byDomainIn[dk][1] + item.usdc).toFixed(2)
+    // Keep at most 20 domains
+    const domInKeys = Object.keys(br.byDomainIn)
+    if (domInKeys.length > 20) {
+      const oldest = domInKeys[0]; delete br.byDomainIn[oldest]
+    }
+  }
 }
 
 // ── T3b Part 6: supply series helpers ────────────────────────────────────────

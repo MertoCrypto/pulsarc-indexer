@@ -38,7 +38,7 @@ function windowSummary(keys, hours) {
   let mbCoverageHours = 0
   let blkAdded = 0, blkRemoved = 0
   const blkAddrAcc = []               // Part 3: latest 10 across window
-  const bridgeAcc = { out: [0, 0, 0], in: [0], byDomain: {} }  // Part 4
+  const bridgeAcc = { out: [0, 0, 0], in: [0, 0, 0], byDomain: {}, byDomainIn: {} }  // Part 4
   let bridgeCoverageHours = 0
   const contracts = new Map()
   for (const k of keys) {
@@ -89,10 +89,18 @@ function windowSummary(keys, hours) {
       bridgeAcc.out[1]  = +(bridgeAcc.out[1] + h.bridge.out[1]).toFixed(2)
       bridgeAcc.out[2]  = +(bridgeAcc.out[2] + h.bridge.out[2]).toFixed(6)
       bridgeAcc.in[0]  += h.bridge.in[0]
+      // in[1] (inbound USDC) and in[2] (inbound fee) — absent in old hours, treat as 0
+      bridgeAcc.in[1]   = +(bridgeAcc.in[1] + (h.bridge.in[1] ?? 0)).toFixed(2)
+      bridgeAcc.in[2]   = +(bridgeAcc.in[2] + (h.bridge.in[2] ?? 0)).toFixed(6)
       for (const [dom, vals] of Object.entries(h.bridge.byDomain ?? {})) {
         bridgeAcc.byDomain[dom] ??= [0, 0]
         bridgeAcc.byDomain[dom][0] += vals[0]
         bridgeAcc.byDomain[dom][1]  = +(bridgeAcc.byDomain[dom][1] + vals[1]).toFixed(2)
+      }
+      for (const [dom, vals] of Object.entries(h.bridge.byDomainIn ?? {})) {
+        bridgeAcc.byDomainIn[dom] ??= [0, 0]
+        bridgeAcc.byDomainIn[dom][0] += vals[0]
+        bridgeAcc.byDomainIn[dom][1]  = +(bridgeAcc.byDomainIn[dom][1] + vals[1]).toFixed(2)
       }
     }
     for (const [addr, tx, wallets, fee] of h.top ?? []) {
@@ -162,16 +170,17 @@ console.log(`${NET}: summary over ${keys.length} hours`)
     series: keys.slice(-168).map((k) => {
       const h = hours[k]
       return {
-        hour: k,
+        hour:    k,
         outCount: h.bridge?.out[0] ?? 0,
         outUsdc:  h.bridge?.out[1] ?? 0,
         inCount:  h.bridge?.in[0]  ?? 0,
+        inUsdc:   h.bridge?.in[1]  ?? 0,
       }
     }),
   }
   for (const [name, n] of Object.entries(WINDOWS)) {
     const w = out.windows[name]
-    bridgeOut.windows[name] = w.bridge ?? { out: [0, 0, 0], in: [0], byDomain: {} }
+    bridgeOut.windows[name] = w.bridge ?? { out: [0, 0, 0], in: [0, 0, 0], byDomain: {}, byDomainIn: {} }
   }
   await writeFile(join(ROOT, 'bridge.json'), JSON.stringify(bridgeOut))
   console.log(`${NET}: bridge.json written`)

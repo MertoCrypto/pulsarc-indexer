@@ -3,6 +3,10 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 
+import { readFileSync } from 'node:fs'
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
 import {
   AUTO_TX_PER_HOUR,
   USER_OP_TOPIC,
@@ -14,6 +18,7 @@ import {
   UNBLACKLISTED_TOPIC,
   DEPOSIT_FOR_BURN_TOPIC,
   MESSAGE_RECEIVED_TOPIC,
+  MINT_AND_WITHDRAW_TOPIC,
   BIG_TRANSFER_USDC,
   TOKEN_MESSENGER_V2,
   MESSAGE_TRANSMITTER_V2,
@@ -26,9 +31,16 @@ import {
   blocklistFromLogs,
   decodeDepositForBurn,
   decodeMessageReceived,
+  decodeMintAndWithdraw,
+  bridgeInsFromReceipt,
+  accumulateBridge,
   parseSupplyHex,
   appendSupplySeries,
 } from '../src/counters.mjs'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const INBOUND_RECEIPT  = JSON.parse(readFileSync(join(__dirname, 'fixtures', 'cctp-inbound-receipt.json'),  'utf8'))
+const OUTBOUND_RECEIPT = JSON.parse(readFileSync(join(__dirname, 'fixtures', 'cctp-outbound-receipt.json'), 'utf8'))
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -596,4 +608,361 @@ describe('appendSupplySeries', () => {
     assert.equal(series[0].supply, 5_100_000, 'second call updates the point in-place')
   })
 
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// CCTP inbound: decodeMintAndWithdraw + bridgeInsFromReceipt
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── Fixture-derived expected values (computed independently with BigInt, not by calling the fn)
+// MintAndWithdraw log is at logIndex 0x8 in the inbound fixture.
+// data = 0x00000000000000000000000000000000000000000000000000000012a05ed988
+//          0000000000000000000000000000000000000000000000000000000000004678
+// word0 (amount raw) = 0x12a05ed988 = 79_999_981_960n  →  / 1e6 = 79999.98196 → toFixed(2) = "79999.98"
+// word1 (fee raw)    = 0x4678       = 18_040n           →  / 1e6 = 0.01804    → toFixed(6) = "0.018040"
+const INBOUND_AMOUNT_RAW = 0x12a05ed988n   // 79_999_981_960n
+const INBOUND_FEE_RAW    = 0x4678n         // 18_040n
+const INBOUND_DECIMALS   = 6
+const EXPECTED_AMOUNT    = +(Number(INBOUND_AMOUNT_RAW) / 10 ** INBOUND_DECIMALS).toFixed(2)  // 79999.98
+const EXPECTED_FEE       = +(Number(INBOUND_FEE_RAW)    / 10 ** INBOUND_DECIMALS).toFixed(6)  // 0.01804
+// sourceDomain in MessageReceived (logIndex 0x9) data word0 = 0x7 = 7
+const EXPECTED_DOMAIN    = Number(0x7n)  // 7
+
+// Mainnet contract addresses from counters.mjs constants
+const TM_MAINNET  = TOKEN_MESSENGER_V2.mainnet   // 0x28b5a0e9c621a5badaa536219b3a228c8168cf5d
+const MT_MAINNET  = MESSAGE_TRANSMITTER_V2.mainnet // 0x81d40f21f12a8f0e3252bccb954d722d4c464b64
+
+describe('decodeMintAndWithdraw', () => {
+  // Find the MintAndWithdraw log in the inbound fixture
+  const mawLog = INBOUND_RECEIPT.logs.find(
+    (l) => l.topics?.[0]?.toLowerCase() === MINT_AND_WITHDRAW_TOPIC.toLowerCase()
+  )
+
+  it('fixture log is found (sanity check)', () => {
+    assert.ok(mawLog, 'MintAndWithdraw log must be present in inbound fixture')
+  })
+
+  it('decodes amount and fee from inbound fixture log — values computed independently via BigInt', () => {
+    assert.equal(EXPECTED_AMOUNT, 79999.98, 'BigInt-derived expected amount must be 79999.98')
+    assert.equal(EXPECTED_FEE,    0.01804,  'BigInt-derived expected fee must be 0.01804')
+
+    const r = decodeMintAndWithdraw(mawLog.data, 6)
+    assert.ok(r, 'should not return null')
+    assert.equal(r.amount, EXPECTED_AMOUNT, `amount should be ${EXPECTED_AMOUNT}`)
+    assert.equal(r.fee,    EXPECTED_FEE,    `fee should be ${EXPECTED_FEE}`)
+  })
+
+  it('returns null on short data (< 2 words = 128 hex chars)', () => {
+    // 1 word only — need 2
+    const oneWord = '0x' + '00'.repeat(32)
+    assert.equal(decodeMintAndWithdraw(oneWord, 6), null)
+  })
+
+  it('returns null on empty data "0x"', () => {
+    assert.equal(decodeMintAndWithdraw('0x', 6), null)
+  })
+
+  it('returns null on non-hex garbage', () => {
+    assert.equal(decodeMintAndWithdraw('not-a-hex-string', 6), null)
+  })
+})
+
+describe('bridgeInsFromReceipt — inbound fixture', () => {
+  const opts = { tokenMessenger: TM_MAINNET, messageTransmitter: MT_MAINNET, usdc: USDC, decimals: 6 }
+
+  it('returns one item with correct usdc, fee, and domain=7', () => {
+    const result = bridgeInsFromReceipt(INBOUND_RECEIPT.logs, opts)
+    assert.equal(result.length, 1, 'should find exactly one inbound mint in this receipt')
+    const item = result[0]
+    assert.equal(item.usdc,   EXPECTED_AMOUNT, `usdc should be ${EXPECTED_AMOUNT}`)
+    assert.equal(item.fee,    EXPECTED_FEE,    `fee should be ${EXPECTED_FEE}`)
+    assert.equal(item.domain, EXPECTED_DOMAIN, `domain should be ${EXPECTED_DOMAIN}`)
+  })
+
+  it('returns [] on the outbound fixture (no MintAndWithdraw)', () => {
+    const result = bridgeInsFromReceipt(OUTBOUND_RECEIPT.logs, opts)
+    assert.equal(result.length, 0, 'outbound receipt must not produce any inbound items')
+  })
+
+  it('domain is null when MessageReceived log is removed', () => {
+    // Strip all MessageReceived logs from the inbound fixture
+    const logsNoMR = INBOUND_RECEIPT.logs.filter(
+      (l) => !(l.address?.toLowerCase() === MT_MAINNET.toLowerCase() &&
+               l.topics?.[0]?.toLowerCase() === MESSAGE_RECEIVED_TOPIC.toLowerCase())
+    )
+    const result = bridgeInsFromReceipt(logsNoMR, opts)
+    assert.equal(result.length, 1, 'should still find the MintAndWithdraw')
+    assert.equal(result[0].domain, null, 'domain must be null when MessageReceived is absent')
+  })
+
+  it('returns [] when mintToken is changed to a non-USDC address', () => {
+    // Replace topics[2] of the MintAndWithdraw log with a different token address
+    const OTHER_TOKEN_PADDED = '0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    const logsOtherToken = INBOUND_RECEIPT.logs.map((l) => {
+      if (l.topics?.[0]?.toLowerCase() !== MINT_AND_WITHDRAW_TOPIC.toLowerCase()) return l
+      return { ...l, topics: [l.topics[0], l.topics[1], OTHER_TOKEN_PADDED, ...(l.topics.slice(3))] }
+    })
+    const result = bridgeInsFromReceipt(logsOtherToken, opts)
+    assert.equal(result.length, 0, 'non-USDC mintToken must be filtered out')
+  })
+
+  it('address matching is case-insensitive', () => {
+    // Pass addresses in uppercase — must still match
+    const optsUpper = {
+      tokenMessenger:     TM_MAINNET.toUpperCase(),
+      messageTransmitter: MT_MAINNET.toUpperCase(),
+      usdc:               USDC.toUpperCase(),
+      decimals:           6,
+    }
+    const result = bridgeInsFromReceipt(INBOUND_RECEIPT.logs, optsUpper)
+    assert.equal(result.length, 1, 'case-insensitive address matching must work')
+    assert.equal(result[0].domain, EXPECTED_DOMAIN)
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// New tests: accumulateBridge, mutant-killing, and ordering
+// ════════════════════════════════════════════════════════════════════════════
+
+// Outbound fixture expected values (computed via BigInt from the log data):
+// DepositForBurn at logIndex 0xa:
+//   word0 (amount raw) = 0x989680 = 10_000_000 → /1e6 = 10.00
+//   word2 (domain)     = 0x6      = 6
+//   word5 (maxFee raw) = 0x0      = 0          → /1e6 → toFixed(6) = "0.000000"
+const OUT_AMOUNT_RAW  = 0x989680n       // 10_000_000n
+const OUT_MAXFEE_RAW  = 0x0n
+const OUT_DECIMALS    = 6
+const EXPECTED_OUT_AMOUNT = +(Number(OUT_AMOUNT_RAW) / 10 ** OUT_DECIMALS).toFixed(2)  // 10.00
+const EXPECTED_OUT_MAXFEE = +(Number(OUT_MAXFEE_RAW)  / 10 ** OUT_DECIMALS).toFixed(6) // 0
+const EXPECTED_OUT_DOMAIN = 6
+
+const BRIDGE_OPTS = {
+  tokenMessenger:     TM_MAINNET,
+  messageTransmitter: MT_MAINNET,
+  usdc:               USDC,
+  decimals:           6,
+}
+
+// ── accumulateBridge: fixture-based tests ────────────────────────────────────
+
+describe('accumulateBridge — outbound fixture', () => {
+  it('(a) outbound fixture once → out[0]=1, out[1]=amount, byDomain[dest]==[1,amount]; in=[0,0,0]', () => {
+    const h = {}
+    accumulateBridge(h, OUTBOUND_RECEIPT.logs, BRIDGE_OPTS)
+    assert.ok(h._bridge, '_bridge must be created')
+    const br = h._bridge
+    assert.equal(br.out[0], 1, 'out count should be 1')
+    assert.equal(br.out[1], EXPECTED_OUT_AMOUNT, `out amount should be ${EXPECTED_OUT_AMOUNT}`)
+    // maxFee from the outbound fixture is 0
+    assert.equal(br.out[2], EXPECTED_OUT_MAXFEE, `out maxFee should be ${EXPECTED_OUT_MAXFEE}`)
+    const dkOut = String(EXPECTED_OUT_DOMAIN)
+    assert.ok(br.byDomain[dkOut], `byDomain['${dkOut}'] must exist`)
+    assert.equal(br.byDomain[dkOut][0], 1)
+    assert.equal(br.byDomain[dkOut][1], EXPECTED_OUT_AMOUNT)
+    // in: outbound receipt has no MessageReceived / MintAndWithdraw on the inbound side
+    assert.deepEqual(br.in, [0, 0, 0], 'in should be [0,0,0] for outbound receipt')
+  })
+})
+
+describe('accumulateBridge — inbound fixture', () => {
+  it('(b) inbound fixture once → in=[1, 79999.98, 0.01804], byDomainIn["7"]=[1, 79999.98]', () => {
+    // Expected values derived from BigInt constants at top of file
+    const h = {}
+    accumulateBridge(h, INBOUND_RECEIPT.logs, BRIDGE_OPTS)
+    assert.ok(h._bridge, '_bridge must be created')
+    const br = h._bridge
+    assert.equal(br.in[0], 1, 'in[0] (MessageReceived count) should be 1')
+    assert.equal(br.in[1], EXPECTED_AMOUNT, `in[1] usdc should be ${EXPECTED_AMOUNT}`)
+    assert.equal(br.in[2], EXPECTED_FEE,    `in[2] fee should be ${EXPECTED_FEE}`)
+    assert.ok(br.byDomainIn, 'byDomainIn must be present')
+    const dkIn = String(EXPECTED_DOMAIN)
+    assert.ok(br.byDomainIn[dkIn], `byDomainIn['${dkIn}'] must exist`)
+    assert.equal(br.byDomainIn[dkIn][0], 1)
+    assert.equal(br.byDomainIn[dkIn][1], EXPECTED_AMOUNT)
+  })
+
+  it('(c) inbound fixture twice on same h → in=[2, 159999.96, 0.03608], byDomainIn["7"]=[2, 159999.96]', () => {
+    // Expected: each step calls toFixed(2) on the running total, so:
+    //   step 1: in[1] = +(0 + 79999.98).toFixed(2) = 79999.98
+    //   step 2: in[1] = +(79999.98 + 79999.98).toFixed(2) = 159999.96
+    //   step 1: in[2] = +(0 + 0.01804).toFixed(6) = 0.01804 (i.e. 0.018040 → 0.01804)
+    //   step 2: in[2] = +(0.01804 + 0.01804).toFixed(6) = 0.03608
+    const EXPECTED_IN1_2X = +(EXPECTED_AMOUNT + EXPECTED_AMOUNT).toFixed(2)   // 159999.96
+    const EXPECTED_IN2_2X = +(EXPECTED_FEE    + EXPECTED_FEE).toFixed(6)      // 0.03608
+    const h = {}
+    accumulateBridge(h, INBOUND_RECEIPT.logs, BRIDGE_OPTS)
+    accumulateBridge(h, INBOUND_RECEIPT.logs, BRIDGE_OPTS)
+    const br = h._bridge
+    assert.equal(br.in[0], 2)
+    assert.equal(br.in[1], EXPECTED_IN1_2X, `in[1] 2x should be ${EXPECTED_IN1_2X}`)
+    assert.equal(br.in[2], EXPECTED_IN2_2X, `in[2] 2x should be ${EXPECTED_IN2_2X}`)
+    const dkIn = String(EXPECTED_DOMAIN)
+    assert.equal(br.byDomainIn[dkIn][0], 2)
+    assert.equal(br.byDomainIn[dkIn][1], EXPECTED_IN1_2X)
+  })
+
+  it('(d) old-shape h with {_bridge:{out:[0,0,0],in:[5],byDomain:{}}} + inbound → in=[6,79999.98,0.01804]', () => {
+    // Simulate a restored open.json with the old in:[n] shape (no in[1], in[2], no byDomainIn)
+    const h = {
+      _bridge: { out: [0, 0, 0], in: [5], byDomain: {} }
+    }
+    accumulateBridge(h, INBOUND_RECEIPT.logs, BRIDGE_OPTS)
+    const br = h._bridge
+    // in[0] = 5 (old) + 1 (MessageReceived) = 6
+    assert.equal(br.in[0], 6, 'in[0] should be 5 (restored) + 1 (MessageReceived)')
+    // in[1], in[2] were absent (undefined); treated as 0 by the ?? 0 guards
+    assert.equal(br.in[1], EXPECTED_AMOUNT, `in[1] should be ${EXPECTED_AMOUNT}`)
+    assert.equal(br.in[2], EXPECTED_FEE,    `in[2] should be ${EXPECTED_FEE}`)
+    // byDomainIn must be created
+    assert.ok(br.byDomainIn, 'byDomainIn must be created from old shape')
+    assert.ok(br.byDomainIn[String(EXPECTED_DOMAIN)], 'byDomainIn entry for domain 7 must exist')
+  })
+
+  it('(e) 21 distinct inbound domains → byDomainIn keeps at most 20 keys', () => {
+    // Build synthetic logs: 21 distinct MintAndWithdraw + matching MessageReceived logs,
+    // each with a unique sourceDomain (0..20).
+    // MintAndWithdraw: address=TM_MAINNET, topic0=MINT_AND_WITHDRAW_TOPIC,
+    //   topics[2] = padded USDC address, data = 2 words (amount=1e6, fee=1000)
+    const mintData = '0x' +
+      (1_000_000n).toString(16).padStart(64, '0') +  // word0: 1 USDC
+      (1000n).toString(16).padStart(64, '0')          // word1: 0.001 fee
+
+    const logs = []
+    for (let domain = 0; domain < 21; domain++) {
+      // MessageReceived log (must appear AFTER the MintAndWithdraw for pairing)
+      const mrData = '0x' + BigInt(domain).toString(16).padStart(64, '0') +
+                     '0'.repeat(64)  // second word (sender, unused)
+      logs.push({
+        address: TM_MAINNET,
+        topics: [
+          MINT_AND_WITHDRAW_TOPIC,
+          '0x' + '1'.padStart(64, '0'),  // mintRecipient
+          '0x' + USDC.replace('0x', '').padStart(64, '0'),  // mintToken = USDC
+        ],
+        data: mintData,
+      })
+      logs.push({
+        address: MT_MAINNET,
+        topics: [MESSAGE_RECEIVED_TOPIC, '0x' + '0'.padStart(64, '0')],
+        data: mrData,
+      })
+    }
+    const h = {}
+    accumulateBridge(h, logs, BRIDGE_OPTS)
+    assert.ok(h._bridge, '_bridge must exist')
+    const keys = Object.keys(h._bridge.byDomainIn)
+    assert.ok(keys.length <= 20, `byDomainIn must have at most 20 keys; got ${keys.length}`)
+  })
+})
+
+// ── Mutant-killing: decodeMintAndWithdraw ────────────────────────────────────
+
+describe('decodeMintAndWithdraw — mutant killers', () => {
+  it('exactly ONE data word (64 hex chars after 0x) returns null — needs 2 words', () => {
+    // 64 hex chars = 32 bytes = 1 word.  The decoder requires raw.length >= 2*64 = 128.
+    const oneWord = '0x' + '1'.repeat(64)
+    assert.equal(decodeMintAndWithdraw(oneWord, 6), null,
+      '1-word data must return null (amount word present but fee word missing)')
+  })
+})
+
+// ── Mutant-killing: bridgeInsFromReceipt ─────────────────────────────────────
+
+describe('bridgeInsFromReceipt — mutant killers', () => {
+  // Shared mint log data: amount=1e6 (1 USDC), fee=0
+  const mintData = '0x' +
+    (1_000_000n).toString(16).padStart(64, '0') +
+    '0'.repeat(64)
+
+  // A valid MintAndWithdraw emitted by the real TokenMessenger with mintToken = USDC
+  const realMintLog = {
+    address: TM_MAINNET,
+    topics: [
+      MINT_AND_WITHDRAW_TOPIC,
+      '0x' + '1'.padStart(64, '0'),
+      '0x' + USDC.replace('0x', '').padStart(64, '0'),
+    ],
+    data: mintData,
+  }
+
+  // A valid MessageReceived emitted by the real MessageTransmitter
+  const mrData = '0x' + (3n).toString(16).padStart(64, '0') + '0'.repeat(64)
+  const realMrLog = {
+    address: MT_MAINNET,
+    topics: [MESSAGE_RECEIVED_TOPIC, '0x' + '0'.padStart(64, '0')],
+    data: mrData,
+  }
+
+  it('MintAndWithdraw with right topic + USDC mintToken but from WRONG address → []', () => {
+    // Spoofed log: same topic and mintToken but emitted by an arbitrary address
+    const spoofedMintLog = { ...realMintLog, address: '0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef' }
+    const result = bridgeInsFromReceipt([realMrLog, spoofedMintLog], BRIDGE_OPTS)
+    assert.equal(result.length, 0,
+      'MintAndWithdraw from a non-tokenMessenger address must be ignored (spoofed log)')
+  })
+
+  it('MessageReceived with right topic but from WRONG address does not provide domain → domain null', () => {
+    // The mint is real; the MessageReceived is spoofed (wrong address)
+    const spoofedMrLog = { ...realMrLog, address: '0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef' }
+    const result = bridgeInsFromReceipt([realMintLog, spoofedMrLog], BRIDGE_OPTS)
+    // The MintAndWithdraw is valid; only the MessageReceived is filtered → domain = null
+    assert.equal(result.length, 1, 'valid MintAndWithdraw must still be returned')
+    assert.equal(result[0].domain, null,
+      'MessageReceived from wrong address must not provide domain')
+  })
+
+  // ── Ordering: pairing spec ─────────────────────────────────────────────────
+  //
+  // Spec: each mint pairs with the FIRST unconsumed MessageReceived AFTER it.
+  // If none found after, fall back to the first unconsumed one BEFORE it.
+  //
+  // Test case 1: [MR(3), MINT_A, MR(6), MINT_B]
+  //   MINT_A: first MR after it → MR(6) → domain 6
+  //   MINT_B: no MR after it → first unconsumed before it → MR(3) → domain 3
+  //
+  // Test case 2: [MINT_A, MR(0), MINT_B, MR(6)]
+  //   MINT_A: first MR after it → MR(0) → domain 0
+  //   MINT_B: first MR after it → MR(6) → domain 6
+
+  function buildMrLog(domain, addr = MT_MAINNET) {
+    return {
+      address: addr,
+      topics: [MESSAGE_RECEIVED_TOPIC, '0x' + '0'.padStart(64, '0')],
+      data: '0x' + BigInt(domain).toString(16).padStart(64, '0') + '0'.repeat(64),
+    }
+  }
+
+  function buildMintLog(addr = TM_MAINNET) {
+    return {
+      address: addr,
+      topics: [
+        MINT_AND_WITHDRAW_TOPIC,
+        '0x' + '1'.padStart(64, '0'),
+        '0x' + USDC.replace('0x', '').padStart(64, '0'),
+      ],
+      data: mintData,
+    }
+  }
+
+  it('ordering [MR(3), MINT_A, MR(6), MINT_B] → A pairs with domain 6, B pairs with domain 3', () => {
+    // Positions: 0=MR(3), 1=MINT_A, 2=MR(6), 3=MINT_B
+    // MINT_A (pos 1): first unconsumed MR after pos 1 → pos 2 = MR(6) → domain 6
+    // MINT_B (pos 3): no unconsumed MR after pos 3 → fall back to pos 0 = MR(3) → domain 3
+    const logs = [buildMrLog(3), buildMintLog(), buildMrLog(6), buildMintLog()]
+    const result = bridgeInsFromReceipt(logs, BRIDGE_OPTS)
+    assert.equal(result.length, 2)
+    assert.equal(result[0].domain, 6, 'MINT_A should pair with MR(6) — first unconsumed MR AFTER it')
+    assert.equal(result[1].domain, 3, 'MINT_B should pair with MR(3) — fallback to unconsumed MR before it')
+  })
+
+  it('ordering [MINT_A, MR(0), MINT_B, MR(6)] → A pairs with domain 0, B pairs with domain 6', () => {
+    // Positions: 0=MINT_A, 1=MR(0), 2=MINT_B, 3=MR(6)
+    // MINT_A (pos 0): first unconsumed MR after pos 0 → pos 1 = MR(0) → domain 0
+    // MINT_B (pos 2): first unconsumed MR after pos 2 → pos 3 = MR(6) → domain 6
+    const logs = [buildMintLog(), buildMrLog(0), buildMintLog(), buildMrLog(6)]
+    const result = bridgeInsFromReceipt(logs, BRIDGE_OPTS)
+    assert.equal(result.length, 2)
+    assert.equal(result[0].domain, 0, 'MINT_A should pair with MR(0) — first unconsumed MR after it')
+    assert.equal(result[1].domain, 6, 'MINT_B should pair with MR(6) — first unconsumed MR after it')
+  })
 })

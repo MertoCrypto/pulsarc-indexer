@@ -12,7 +12,9 @@ const SRC = join(dirname(fileURLToPath(import.meta.url)), '..', 'src')
 function sandbox(hours) {
   const d = mkdtempSync(join(tmpdir(), 'pipe-'))
   mkdirSync(join(d, 'src'))
-  for (const f of ['summarize.mjs', 'supply.mjs', 'counters.mjs']) cpSync(join(SRC, f), join(d, 'src', f))
+  for (const f of ['summarize.mjs', 'supply.mjs', 'counters.mjs']) {
+    try { cpSync(join(SRC, f), join(d, 'src', f)) } catch { /* file absent in this workspace — skip */ }
+  }
   const dir = join(d, 'data', 'testnet', 'hourly')
   mkdirSync(dir, { recursive: true })
   const byDay = {}
@@ -36,10 +38,10 @@ describe('summarize.mjs end to end', () => {
       [hk(2)]: { ...base, auto: { senders: 2, tx: 150 }, aa: 4, aaTx: 3, buckets: [[10, 50], [2, 600], [1, 20000]],
         big: [{ tx: '0x1', amt: 6_000_000, from: '0xa', to: '0xb' }], mb: { usdc: [10, 4] }, blk: [1, 0],
         blkAddr: [{ token: 'usdc', addr: '0xdead', kind: 'added' }],
-        bridge: { out: [2, 30, 0.5], in: [1], byDomain: { 0: [2, 30] } } },
+        bridge: { out: [2, 30, 0.5], in: [1, 50, 0.01], byDomain: { 0: [2, 30] }, byDomainIn: { '7': [1, 50] } } },
       [hk(1)]: { ...base, auto: { senders: 1, tx: 70 }, aa: 1, buckets: [[5, 25], [0, 0], [0, 0]],
         big: [{ tx: '0x2', amt: 9_000_000, from: '0xc', to: '0xd' }], mb: { usdc: [1, 1], eurc: [2, 0] },
-        bridge: { out: [1, 5, 0], in: [2], byDomain: { 0: [1, 5], 6: [1, 5] } } },
+        bridge: { out: [1, 5, 0], in: [2, 100, 0.02], byDomain: { 0: [1, 5], 6: [1, 5] }, byDomainIn: { '7': [2, 100] } } },
     })
     const r = await run(d, 'summarize.mjs')
     assert.equal(r.status, 0, r.stderr)
@@ -56,14 +58,17 @@ describe('summarize.mjs end to end', () => {
     assert.deepEqual(w.mb.eurc, [2, 0])
     assert.deepEqual(w.blk.slice(0, 2), [1, 0])
     assert.deepEqual(w.bridge.out.slice(0, 2), [3, 35])
-    assert.deepEqual(w.bridge.in, [3])
+    assert.equal(w.bridge.in[0], 3)
+    assert.equal(w.bridge.in[1], 150)    // 50 + 100
+    assert.equal(w.bridge.in[2], 0.03)   // 0.01 + 0.02
     assert.deepEqual(w.bridge.byDomain['0'], [3, 35])
+    assert.deepEqual(w.bridge.byDomainIn['7'], [3, 150])
     assert.equal(w.bridgeCoverageHours, 2)
   })
 
   it('writes bridge.json with 1h/24h/7d windows and a series', async () => {
     const d = sandbox({
-      [hk(2)]: { ...base, bridge: { out: [2, 30, 0.5], in: [1], byDomain: { 0: [2, 30] } } },
+      [hk(2)]: { ...base, bridge: { out: [2, 30, 0.5], in: [1, 50, 0.01], byDomain: { 0: [2, 30] }, byDomainIn: { '7': [1, 50] } } },
       [hk(1)]: { ...base },
     })
     const r = await run(d, 'summarize.mjs')
@@ -73,6 +78,10 @@ describe('summarize.mjs end to end', () => {
     assert.deepEqual(Object.keys(b.windows).sort(), ['1h', '24h', '7d'])
     assert.equal(b.windows['24h'].out[0], 2)
     assert.ok(Array.isArray(b.series) && b.series.length >= 1)
+    // series row for the hour with bridge data has inUsdc
+    const rowWithData = b.series.find((s) => s.inUsdc > 0)
+    assert.ok(rowWithData, 'at least one series row must have inUsdc > 0')
+    assert.equal(rowWithData.inUsdc, 50)
   })
 
   it('hours with only old keys produce no new fields', async () => {
@@ -81,6 +90,33 @@ describe('summarize.mjs end to end', () => {
     assert.equal(r.status, 0, r.stderr)
     const w = read(d, 'latest.json').windows['24h']
     for (const k of ['auto', 'aa', 'buckets', 'big', 'mb', 'blk', 'bridge']) assert.equal(k in w, false, k)
+  })
+
+  it('mixing old hour (in:[1], no byDomainIn) with new hour (in:[2,100.5,0.02]) sums correctly', async () => {
+    // OLD hour: bridge with legacy in:[count] shape and no byDomainIn
+    // NEW hour: bridge with full in:[count, usdc, fee] and byDomainIn
+    const d = sandbox({
+      [hk(3)]: { ...base, bridge: { out: [1, 10, 0], in: [1], byDomain: {} } },
+      [hk(2)]: { ...base, bridge: { out: [1, 5, 0],  in: [2, 100.5, 0.02], byDomain: {}, byDomainIn: { '7': [2, 100.5] } } },
+    })
+    const r = await run(d, 'summarize.mjs')
+    assert.equal(r.status, 0, r.stderr)
+    const w = read(d, 'latest.json').windows['24h']
+    // in[0]: 1 + 2 = 3
+    assert.equal(w.bridge.in[0], 3, 'in[0] = old count + new count')
+    // in[1]: 0 (absent in old, treated as 0) + 100.5 = 100.5
+    assert.equal(w.bridge.in[1], 100.5, 'in[1] = 0 + 100.5')
+    // in[2]: 0 + 0.02 = 0.02
+    assert.equal(w.bridge.in[2], 0.02, 'in[2] = 0 + 0.02')
+    // byDomainIn: only the new hour contributes
+    assert.deepEqual(w.bridge.byDomainIn['7'], [2, 100.5], 'byDomainIn[7] from new hour')
+
+    // Verify bridge.json series has inUsdc field
+    const b = read(d, 'bridge.json')
+    const rowNew = b.series.find((s) => s.inUsdc === 100.5)
+    assert.ok(rowNew, 'bridge.json series must have a row with inUsdc=100.5')
+    const rowOld = b.series.find((s) => s.inUsdc === 0 && s.inCount === 1)
+    assert.ok(rowOld, 'old-shape hour must produce inUsdc=0 in bridge.json series')
   })
 })
 

@@ -33,6 +33,8 @@ import {
   DEPOSIT_FOR_BURN_TOPIC, MESSAGE_RECEIVED_TOPIC,
   bigTransfers, mintBurnFromLogs, blocklistFromLogs,
   decodeDepositForBurn, decodeMessageReceived,
+  bridgeInsFromReceipt,
+  accumulateBridge,
   badReceiptIndexes,
 } from './counters.mjs'
 
@@ -620,35 +622,13 @@ async function apply(blockNumbers, out, open) {
           }
         }
 
-        // T3b Part 4: CCTP bridge — outgoing (DepositForBurn from TokenMessenger)
-        for (const log of r.logs ?? []) {
-          if (!log.topics?.length) continue
-          if (log.address?.toLowerCase() === TOKEN_MESSENGER_ADDR &&
-              log.topics[0].toLowerCase() === DEPOSIT_FOR_BURN_TOPIC) {
-            const decoded = decodeDepositForBurn(log.data, usdcDec)
-            if (decoded) {
-              const br = h._bridge ?? (h._bridge = { out: [0, 0, 0], in: [0], byDomain: {} })
-              br.out[0]++
-              br.out[1] = +(br.out[1] + decoded.amount).toFixed(2)
-              br.out[2] = +(br.out[2] + decoded.maxFee).toFixed(6)
-              const dk = String(decoded.domain)
-              br.byDomain[dk] ??= [0, 0]
-              br.byDomain[dk][0]++
-              br.byDomain[dk][1] = +(br.byDomain[dk][1] + decoded.amount).toFixed(2)
-              // Keep at most 20 domains
-              const domKeys = Object.keys(br.byDomain)
-              if (domKeys.length > 20) {
-                const oldest = domKeys[0]; delete br.byDomain[oldest]
-              }
-            }
-          }
-          // T3b Part 4: CCTP bridge — incoming (MessageReceived from MessageTransmitter)
-          if (log.address?.toLowerCase() === MESSAGE_TRANSMITTER_ADDR &&
-              log.topics[0].toLowerCase() === MESSAGE_RECEIVED_TOPIC) {
-            const br = h._bridge ?? (h._bridge = { out: [0, 0, 0], in: [0], byDomain: {} })
-            br.in[0]++
-          }
-        }
+        // T3b Part 4: CCTP bridge — delegate to accumulateBridge (outgoing + incoming)
+        accumulateBridge(h, r.logs ?? [], {
+          tokenMessenger:     TOKEN_MESSENGER_ADDR,
+          messageTransmitter: MESSAGE_TRANSMITTER_ADDR,
+          usdc:               USDC,
+          decimals:           usdcDec,
+        })
       }
     }
     // ── App stats (v2) ──
