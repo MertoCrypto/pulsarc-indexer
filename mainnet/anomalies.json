@@ -1,0 +1,1 @@
+{"network":"mainnet","generatedAt":"2026-10-24T16:09:18.584Z","items":[{"app":"cirbtc","kind":"spike","ratio":3.6,"txs":2163,"baseline":603},{"app":"weth","kind":"spike","ratio":3.4,"txs":1936,"baseline":566}],"status":"ok","hour":"2026-10-24T15"}
